@@ -1,0 +1,39 @@
+{
+  "name": "opencode2api",
+  "version": "1.0.0",
+  "description": "An OpenAI-compatible API gateway for the OpenCode CLI, enabling the use of free models (Kimi, GLM, MiniMax) in standard AI clients.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest",
+    "test:unit": "npm test",
+    "test:integration": "bash tests/test-integration.sh"
+  },
+  "keywords": [
+    "opencode",
+    "openai",
+    "proxy",
+    "kimi",
+    "glm",
+    "minimax",
+    "ai",
+    "api"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.1.51",
+    "axios": "^1.7.9",
+    "body-parser": "^1.20.3",
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "jest": "^30.2.0",
+    "supertest": "^7.2.2"
+  }
+}

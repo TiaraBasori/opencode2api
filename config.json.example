@@ -1,0 +1,16 @@
+{
+    "PORT": 10000,
+    "API_KEY": "your-secret-api-key",
+    "BIND_HOST": "0.0.0.0",
+    "DISABLE_TOOLS": true,
+    "USE_ISOLATED_HOME": false,
+    "PROMPT_MODE": "standard",
+    "OMIT_SYSTEM_PROMPT": false,
+    "AUTO_CLEANUP_CONVERSATIONS": false,
+    "CLEANUP_INTERVAL_MS": 43200000,
+    "CLEANUP_MAX_AGE_MS": 86400000,
+    "DEBUG": false,
+    "OPENCODE_SERVER_URL": "http://127.0.0.1:10001",
+    "OPENCODE_PATH": "opencode",
+    "REQUEST_TIMEOUT_MS": 180000
+}

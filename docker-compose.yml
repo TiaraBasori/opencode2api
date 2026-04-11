@@ -1,0 +1,42 @@
+services:
+  opencode2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/tiarabasori/opencode2api:latest
+    container_name: opencode2api
+    ports:
+      - "${OPENCODE_PROXY_PORT:-10000}:${OPENCODE_PROXY_PORT:-10000}"
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - OPENCODE_SERVER_PASSWORD=${OPENCODE_SERVER_PASSWORD:-}
+      - OPENCODE_ZEN_API_KEY=${OPENCODE_ZEN_API_KEY:-}
+      - API_KEY=${API_KEY:-}
+      - BIND_HOST=0.0.0.0
+      - DISABLE_TOOLS=${DISABLE_TOOLS:-true}
+      - OPENCODE_USE_ISOLATED_HOME=${OPENCODE_USE_ISOLATED_HOME:-false}
+      - OPENCODE_PROXY_DEBUG=${OPENCODE_PROXY_DEBUG:-false}
+      - OPENCODE_PROXY_PROMPT_MODE=${OPENCODE_PROXY_PROMPT_MODE:-standard}
+      - OPENCODE_PROXY_OMIT_SYSTEM_PROMPT=${OPENCODE_PROXY_OMIT_SYSTEM_PROMPT:-false}
+      - OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=${OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS:-false}
+      - OPENCODE_PROXY_CLEANUP_INTERVAL_MS=${OPENCODE_PROXY_CLEANUP_INTERVAL_MS:-43200000}
+      - OPENCODE_PROXY_CLEANUP_MAX_AGE_MS=${OPENCODE_PROXY_CLEANUP_MAX_AGE_MS:-86400000}
+      - OPENCODE_PROXY_REQUEST_TIMEOUT_MS=${OPENCODE_PROXY_REQUEST_TIMEOUT_MS:-180000}
+      - OPENCODE_PROXY_PORT=${OPENCODE_PROXY_PORT:-10000}
+      - OPENCODE_SERVER_PORT=${OPENCODE_SERVER_PORT:-10001}
+    volumes:
+      - opencode-data:/home/node/.local/share/opencode
+      - opencode-config:/home/node/.config/opencode
+      - .:/home/node/project
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${OPENCODE_PROXY_PORT:-10000}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  opencode-data:
+  opencode-config:
