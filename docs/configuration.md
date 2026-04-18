@@ -30,6 +30,8 @@
 | 变量 | 默认值 | 说明 |
 |:-----|:-------|:-----|
 | `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用 |
+| `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
+| `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具冲突隔离策略；当前仅支持 `namespace` |
 | `USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录 |
 | `PROMPT_MODE` | `standard` | 提示词处理模式 |
 | `OMIT_SYSTEM_PROMPT` | `false` | 忽略传入的 system prompt |
@@ -56,6 +58,8 @@
     "API_KEY": "your-secret-api-key",
     "BIND_HOST": "0.0.0.0",
     "DISABLE_TOOLS": true,
+    "EXTERNAL_TOOLS_MODE": "proxy-bridge",
+    "EXTERNAL_TOOLS_CONFLICT_POLICY": "namespace",
     "USE_ISOLATED_HOME": false,
     "PROMPT_MODE": "standard",
     "OMIT_SYSTEM_PROMPT": false,
@@ -67,6 +71,37 @@
     "OPENCODE_PATH": "opencode",
     "REQUEST_TIMEOUT_MS": 180000
 }
+```
+
+---
+
+## 🛠️ 外部工具桥接
+
+OpenCode2API 现在支持把外部客户端传入的 OpenAI-compatible `tools` 桥接到代理层，而不是把这些工具直接暴露为 OpenCode 内置工具。
+
+### 当前支持的模式
+
+| 配置项 | 支持值 | 说明 |
+|:------|:------|:-----|
+| `OPENCODE_EXTERNAL_TOOLS_MODE` / `EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 由代理虚拟化外部工具，并返回 OpenAI-compatible tool calling 结果 |
+| `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` / `EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 使用代理内部命名空间隔离同名冲突 |
+
+### 工具冲突策略
+
+- 外部客户端工具优先以“代理桥接”的方式参与对话。
+- OpenCode 内置工具仍按现有 `DISABLE_TOOLS` 机制管理，不会因为客户端传入同名工具而被误触发。
+- 代理内部会使用类似 `external__web_fetch` 的命名空间名避免冲突。
+- 这些内部命名空间名称不会作为公开 API 的一部分暴露给客户端。
+
+### 推荐生产配置
+
+```bash
+DISABLE_TOOLS=true
+OPENCODE_EXTERNAL_TOOLS_MODE=proxy-bridge
+OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY=namespace
+OPENCODE_PROXY_PROMPT_MODE=plugin-inject
+OPENCODE_PROXY_OMIT_SYSTEM_PROMPT=true
+OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 ```
 
 ---
@@ -86,6 +121,8 @@
 
 ```bash
 DISABLE_TOOLS=true
+OPENCODE_EXTERNAL_TOOLS_MODE=proxy-bridge
+OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY=namespace
 OPENCODE_PROXY_PROMPT_MODE=plugin-inject
 OPENCODE_PROXY_OMIT_SYSTEM_PROMPT=true
 OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
