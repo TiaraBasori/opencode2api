@@ -29,6 +29,7 @@ const defaultConfig = {
     DISABLE_TOOLS: true,
     EXTERNAL_TOOLS_MODE: 'proxy-bridge',
     EXTERNAL_TOOLS_CONFLICT_POLICY: 'namespace',
+    INTERNAL_WEB_FETCH_ENABLED: parseBool(process.env.OPENCODE_INTERNAL_WEB_FETCH_ENABLED, false),
     PROMPT_MODE: process.env.OPENCODE_PROXY_PROMPT_MODE || 'standard',
     OMIT_SYSTEM_PROMPT: parseBool(process.env.OPENCODE_PROXY_OMIT_SYSTEM_PROMPT, false),
     AUTO_CLEANUP_CONVERSATIONS: parseBool(process.env.OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS, false),
@@ -62,6 +63,7 @@ const finalConfig = {
     DISABLE_TOOLS: parseBool(process.env.OPENCODE_DISABLE_TOOLS, parseBool(fileConfig.DISABLE_TOOLS, defaultConfig.DISABLE_TOOLS)),
     EXTERNAL_TOOLS_MODE: process.env.OPENCODE_EXTERNAL_TOOLS_MODE || fileConfig.EXTERNAL_TOOLS_MODE || defaultConfig.EXTERNAL_TOOLS_MODE,
     EXTERNAL_TOOLS_CONFLICT_POLICY: process.env.OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY || fileConfig.EXTERNAL_TOOLS_CONFLICT_POLICY || defaultConfig.EXTERNAL_TOOLS_CONFLICT_POLICY,
+    INTERNAL_WEB_FETCH_ENABLED: parseBool(process.env.OPENCODE_INTERNAL_WEB_FETCH_ENABLED, parseBool(fileConfig.INTERNAL_WEB_FETCH_ENABLED, defaultConfig.INTERNAL_WEB_FETCH_ENABLED)),
     USE_ISOLATED_HOME: parseBool(process.env.OPENCODE_USE_ISOLATED_HOME, parseBool(fileConfig.USE_ISOLATED_HOME, false)),
     REQUEST_TIMEOUT_MS: parseInt(process.env.OPENCODE_PROXY_REQUEST_TIMEOUT_MS) || fileConfig.REQUEST_TIMEOUT_MS || 180000,
     DEBUG: parseBool(process.env.OPENCODE_PROXY_DEBUG, parseBool(fileConfig.DEBUG, false)),
@@ -103,6 +105,7 @@ console.log(`  - Zen API Key: ${finalConfig.ZEN_API_KEY ? 'Configured' : 'Not co
 console.log(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
 console.log(`  - External Tools Mode: ${finalConfig.EXTERNAL_TOOLS_MODE}`);
 console.log(`  - External Tools Conflict Policy: ${finalConfig.EXTERNAL_TOOLS_CONFLICT_POLICY}`);
+console.log(`  - Internal web_fetch Enabled: ${finalConfig.INTERNAL_WEB_FETCH_ENABLED ? 'Yes' : 'No'}`);
 console.log(`  - Use Isolated Home: ${finalConfig.USE_ISOLATED_HOME ? 'Yes' : 'No'}`);
 console.log(`  - Request Timeout: ${finalConfig.REQUEST_TIMEOUT_MS}ms`);
 console.log(`  - Prompt Mode: ${finalConfig.PROMPT_MODE}`);
