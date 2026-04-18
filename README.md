@@ -21,6 +21,7 @@
 | 🧠 **推理控制** | 支持 `reasoning_effort` 和 `reasoning: { "effort": "high" }` |
 | 🐳 **Docker 部署** | 一键部署，自动启动 OpenCode 后端 |
 | 🛡️ **工具安全** | 默认禁用工具调用 |
+| 🔧 **外部工具桥接** | 支持外部客户端传入 `tools`，由代理桥接为 OpenAI-compatible `tool_calls` / `function_call`，避免命中 OpenCode 内置工具 |
 
 ---
 
@@ -90,6 +91,64 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
   }'
 ```
 
+### Chat Completions + 外部工具
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/big-pickle",
+    "messages": [{"role": "user", "content": "帮我获取 https://example.com 的标题"}],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "web_fetch",
+          "description": "Fetch a URL and return its content summary",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "url": {"type": "string"}
+            },
+            "required": ["url"]
+          }
+        }
+      }
+    ]
+  }'
+```
+
+### Responses API + 外部工具流式
+
+```bash
+curl -N -X POST http://127.0.0.1:10000/v1/responses \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/big-pickle",
+    "input": "查询东京天气",
+    "stream": true,
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "weather_lookup",
+          "description": "Look up weather by city",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {"type": "string"},
+              "unit": {"type": "string"}
+            },
+            "required": ["city"]
+          }
+        }
+      }
+    ]
+  }'
+```
+
 ---
 
 ## 📦 部署方式
@@ -112,6 +171,8 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 | `API_KEY` | - | Bearer Token 认证密钥 |
 | `BIND_HOST` | `0.0.0.0` | 绑定地址 |
 | `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用 |
+| `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
+| `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具与 OpenCode 内置工具的冲突隔离策略；当前仅支持 `namespace` |
 | `USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录 |
 | `OPENCODE_PROXY_PROMPT_MODE` | `standard` | 提示词处理模式 |
 | `OPENCODE_PROXY_OMIT_SYSTEM_PROMPT` | `false` | 忽略传入的 system prompt |
@@ -133,10 +194,19 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 API_KEY=your-secret-key
 OPENCODE_SERVER_PASSWORD=your-password
 DISABLE_TOOLS=true
+OPENCODE_EXTERNAL_TOOLS_MODE=proxy-bridge
+OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY=namespace
 OPENCODE_PROXY_PROMPT_MODE=plugin-inject
 OPENCODE_PROXY_OMIT_SYSTEM_PROMPT=true
 OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 ```
+
+### 外部工具桥接说明
+
+- 外部客户端传入的 `tools` 不会被注册为 OpenCode 内置工具。
+- 代理会把这些工具虚拟化后交给模型使用，并把模型输出重新整理为 OpenAI-compatible `tool_calls` / `function_call`。
+- 同名冲突默认通过内部命名空间隔离处理，例如客户端的 `web_fetch` 不会误触发 OpenCode 容器内工具。
+- 内部命名空间名（如 `external__web_fetch`）是代理内部实现细节，不属于公开 API。
 
 ---
 
