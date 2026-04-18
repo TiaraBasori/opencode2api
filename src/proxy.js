@@ -9,6 +9,16 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import { buildExternalToolRegistry, findExternalToolByName } from './tool-runtime/registry.js';
+import { buildToolExposure } from './tool-runtime/router.js';
+import { evaluateToolPolicy } from './tool-runtime/policy.js';
+import { validateToolCalls } from './tool-runtime/validator.js';
+import {
+    stripFunctionCallMarkup,
+    parseExternalToolCallsFromText,
+    createToolCallFilter,
+    createExternalToolCallStreamParser
+} from './tool-runtime/parser.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -447,7 +457,6 @@ export function createApp(config) {
     };
 
     const TOOL_GUARD_MESSAGE = 'Tools are disabled. Do not call tools or function calls. Answer directly from the conversation and general knowledge. If external or real-time data is required, say so and ask the user to enable tools.';
-    const EXTERNAL_TOOL_PREFIX = 'external__';
     const EXTERNAL_TOOL_GUARD_MESSAGE = 'OpenCode internal tools remain disabled. If an external tool contract is present, use only that contract and never call or mention OpenCode internal tools.';
 
     const buildSystemPrompt = (systemMsg, reasoningEffort = null, hasExternalTools = false) => {
@@ -478,161 +487,13 @@ export function createApp(config) {
         return effortMap[value.toLowerCase()] || fallback;
     };
 
-    const stripFunctionCallMarkup = (text, trim = true) => {
-        if (!text) return text;
-        const cleaned = text
-            .replace(/<function_calls>[\s\S]*?<\/function_calls>/g, '')
-            .replace(/<\/?function_calls>/g, '');
-        return trim ? cleaned.trim() : cleaned;
-    };
-
-    const parseToolCallsFromText = (...chunks) => {
-        const matches = [];
-        chunks.forEach((chunk) => {
-            if (!chunk || typeof chunk !== 'string') return;
-            const blocks = chunk.matchAll(/<function_calls>([\s\S]*?)<\/function_calls>/g);
-            for (const block of blocks) {
-                const payload = block?.[1]?.trim();
-                if (!payload) continue;
-                try {
-                    const parsed = JSON.parse(payload);
-                    const rawCalls = Array.isArray(parsed)
-                        ? parsed
-                        : Array.isArray(parsed?.tool_calls)
-                            ? parsed.tool_calls
-                            : [parsed];
-                    rawCalls.forEach((rawCall, index) => {
-                        const name = rawCall?.function?.name || rawCall?.name;
-                        const rawArgs = rawCall?.function?.arguments ?? rawCall?.arguments ?? {};
-                        if (!name) return;
-                        matches.push({
-                            id: rawCall?.id || `call_${Date.now()}_${matches.length + index + 1}`,
-                            type: 'function',
-                            function: {
-                                name,
-                                arguments: typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs)
-                            }
-                        });
-                    });
-                } catch (e) {
-                    logDebug('Failed to parse function_calls block', { error: e.message });
-                }
-            }
-        });
-        return matches;
-    };
-
-    const buildExternalToolRegistry = (tools) => {
-        if (!Array.isArray(tools) || tools.length === 0) return [];
-        const registry = [];
-        const seen = new Set();
-        tools.forEach((tool) => {
-            if (tool?.type !== 'function' || !tool?.function?.name) return;
-            const originalName = String(tool.function.name).trim();
-            if (!originalName) return;
-            let namespacedName = `${EXTERNAL_TOOL_PREFIX}${originalName}`;
-            let counter = 2;
-            while (seen.has(namespacedName)) {
-                namespacedName = `${EXTERNAL_TOOL_PREFIX}${originalName}_${counter}`;
-                counter += 1;
-            }
-            seen.add(namespacedName);
-            registry.push({
-                originalName,
-                namespacedName,
-                description: typeof tool.function.description === 'string' ? tool.function.description : '',
-                parameters: tool.function.parameters && typeof tool.function.parameters === 'object'
-                    ? tool.function.parameters
-                    : { type: 'object', properties: {} }
-            });
-        });
-        return registry;
-    };
-
-    const findExternalToolByName = (registry, name) => {
-        if (!name) return null;
-        return registry.find((tool) => tool.namespacedName === name || tool.originalName === name) || null;
-    };
-
-    const normalizeExternalToolChoice = (toolChoice, registry) => {
-        if (!toolChoice || !Array.isArray(registry) || registry.length === 0) {
-            return { mode: 'auto', requiredTool: null };
-        }
-        if (toolChoice === 'auto' || toolChoice === 'none') {
-            return { mode: toolChoice, requiredTool: null };
-        }
-        if (toolChoice === 'required') {
-            return { mode: 'required', requiredTool: null };
-        }
-        const requestedName = toolChoice?.function?.name;
-        if (toolChoice?.type === 'function' && requestedName) {
-            const mappedTool = findExternalToolByName(registry, requestedName);
-            return {
-                mode: 'required',
-                requiredTool: mappedTool?.namespacedName || `${EXTERNAL_TOOL_PREFIX}${requestedName}`
-            };
-        }
-        return { mode: 'auto', requiredTool: null };
-    };
-
-    const buildExternalToolsPrompt = (registry, toolChoice = null) => {
-        if (!Array.isArray(registry) || registry.length === 0) return '';
-        const normalizedChoice = normalizeExternalToolChoice(toolChoice, registry);
-        const choiceInstructions = [];
-        if (normalizedChoice.mode === 'required') {
-            if (normalizedChoice.requiredTool) {
-                choiceInstructions.push(`Tool use is REQUIRED for this turn. You MUST call ${normalizedChoice.requiredTool} before giving any final answer.`);
-            } else {
-                choiceInstructions.push('Tool use is REQUIRED for this turn. You MUST call an external tool before giving any final answer.');
-            }
-        } else if (normalizedChoice.mode === 'none') {
-            choiceInstructions.push('Tool use is disabled for this turn. Do not emit <function_calls>.');
-        }
-        return [
-            'External tools are virtualized by this proxy. They are not OpenCode tools.',
-            'When you need an external tool, your entire assistant reply MUST be ONLY one or more <function_calls>...</function_calls> blocks.',
-            'Do NOT output <think>, explanations, markdown, prose, or any text before or after <function_calls> blocks when making a tool call.',
-            'Each block must contain JSON with this exact shape:',
-            '{"name":"external__tool_name","arguments":{}}',
-            'Arguments must be a valid JSON object that matches the declared schema.',
-            'Use only the namespaced names listed below. Do not use original client tool names inside function calls.',
-            'If tool results are later provided as TOOL_RESULT messages, use those results to continue normally.',
-            ...choiceInstructions,
-            `Available external tools: ${JSON.stringify(registry.map((tool) => ({
-                name: tool.namespacedName,
-                client_name: tool.originalName,
-                description: tool.description,
-                parameters: tool.parameters
-            })))}`
-        ].join('\n');
-    };
-
-    const parseExternalToolCallsFromText = (registry, ...chunks) => {
-        if (!Array.isArray(registry) || registry.length === 0) return [];
-        const rawCalls = parseToolCallsFromText(...chunks);
-        const counts = new Map();
-        return rawCalls.flatMap((rawCall) => {
-            const tool = findExternalToolByName(registry, rawCall?.function?.name);
-            if (!tool) return [];
-            const nextCount = (counts.get(tool.namespacedName) || 0) + 1;
-            counts.set(tool.namespacedName, nextCount);
-            return [{
-                id: rawCall.id || `call_${tool.namespacedName.replace(/[^a-zA-Z0-9_]/g, '_')}_${nextCount}`,
-                type: 'function',
-                function: {
-                    name: tool.originalName,
-                    arguments: rawCall.function.arguments
-                }
-            }];
-        });
-    };
-
     const stripFunctionCalls = (text, trim = true) => {
         if (!DISABLE_TOOLS || !text) return text;
         return stripFunctionCallMarkup(text, trim);
     };
 
     const normalizeTextContent = (content) => {
+
         if (typeof content === 'string') return content;
         if (Array.isArray(content)) {
             return content.map((part) => {
@@ -672,64 +533,87 @@ export function createApp(config) {
         return String(content);
     };
 
-    const createToolCallFilter = (forceStrip = false) => {
-        if (!DISABLE_TOOLS && !forceStrip) return (chunk) => chunk;
-        let inBlock = false;
-        return (chunk) => {
-            if (!chunk) return chunk;
-            let output = '';
-            let remaining = chunk;
-            while (remaining.length) {
-                if (inBlock) {
-                    const endIdx = remaining.indexOf('</function_calls>');
-                    if (endIdx === -1) {
-                        return output;
-                    }
-                    remaining = remaining.slice(endIdx + '</function_calls>'.length);
-                    inBlock = false;
-                    continue;
-                }
-                const startIdx = remaining.indexOf('<function_calls>');
-                if (startIdx === -1) {
-                    output += remaining;
-                    return output;
-                }
-                output += remaining.slice(0, startIdx);
-                remaining = remaining.slice(startIdx + '<function_calls>'.length);
-                inBlock = true;
-            }
-            return output;
+    const createExternalToolContext = (tools, toolChoice) => {
+        const registry = buildExternalToolRegistry(tools);
+        const exposure = buildToolExposure(registry, toolChoice);
+        return {
+            registry,
+            exposure,
+            toolChoice: exposure.toolChoice,
+            prompt: exposure.prompt
         };
     };
 
-    const createExternalToolCallStreamParser = (registry) => {
-        if (!Array.isArray(registry) || registry.length === 0) {
-            return () => [];
-        }
-        const openTag = '<function_calls>';
-        const closeTag = '</function_calls>';
-        let buffer = '';
-        return (chunk) => {
-            if (!chunk) return [];
-            buffer += chunk;
-            const parsedCalls = [];
-            while (buffer.length) {
-                const startIdx = buffer.indexOf(openTag);
-                if (startIdx === -1) {
-                    buffer = buffer.slice(-(openTag.length - 1));
-                    break;
-                }
-                const endIdx = buffer.indexOf(closeTag, startIdx + openTag.length);
-                if (endIdx === -1) {
-                    buffer = buffer.slice(startIdx);
-                    break;
-                }
-                const block = buffer.slice(startIdx, endIdx + closeTag.length);
-                parsedCalls.push(...parseExternalToolCallsFromText(registry, block));
-                buffer = buffer.slice(endIdx + closeTag.length);
+    const getPolicyDecision = (toolCall) => {
+        const toolDescriptor = toolCall?.tool || findExternalToolByName([], toolCall?.function?.name);
+        return evaluateToolPolicy(toolDescriptor, toolCall?.validatedArguments || {}, { config });
+    };
+
+    const finalizeValidatedToolCalls = (parsedToolCalls, registry) => {
+        const { validCalls, invalidCalls } = validateToolCalls(parsedToolCalls, registry);
+        invalidCalls.forEach(({ call, validation }) => {
+            logDebug('Rejected external tool call', {
+                tool: call?.function?.name,
+                errors: validation?.errors?.map((error) => error.message)
+            });
+        });
+        const allowedCalls = [];
+        validCalls.forEach((toolCall) => {
+            const policyDecision = evaluateToolPolicy(toolCall.tool, toolCall.validatedArguments, { config });
+            if (policyDecision.status === 'allow') {
+                allowedCalls.push(toolCall);
+                return;
             }
-            return parsedCalls;
+            logDebug('Blocked external tool call', {
+                tool: toolCall.function.name,
+                status: policyDecision.status,
+                reason: policyDecision.reason
+            });
+        });
+        return { validCalls: allowedCalls, invalidCalls };
+    };
+
+    const toPublicToolCalls = (toolCalls) => {
+        if (!Array.isArray(toolCalls) || toolCalls.length === 0) return [];
+        return toolCalls.map((toolCall) => ({
+            id: toolCall.id,
+            type: 'function',
+            function: {
+                name: toolCall.function.name,
+                arguments: toolCall.function.arguments
+            }
+        }));
+    };
+
+    const createForcedToolCallRequester = ({
+        mode,
+        sessionId,
+        systemWithGuard,
+        requiredTool,
+        providerID,
+        modelID,
+        toolOverrides,
+        requestTimeoutMs,
+        forbidThinkBlock = false
+    }) => async () => {
+        if (mode !== 'required') return null;
+        if (!requiredTool) return null;
+        const forcedPromptParams = {
+            path: { id: sessionId },
+            body: {
+                model: { providerID, modelID },
+                ...(systemWithGuard ? { system: systemWithGuard } : {}),
+                parts: [{
+                    type: 'text',
+                    text: `SYSTEM: Your previous reply did not emit the required external tool call. Reply now with ONLY <function_calls>{\"name\":\"${requiredTool}\",\"arguments\":{}}</function_calls> or an array inside <function_calls>...</function_calls>. Do not output any prose, reasoning, markdown${forbidThinkBlock ? ', or <think> block' : ''}. Infer the correct arguments from the conversation so far.`
+                }]
+            }
         };
+        if (toolOverrides && Object.keys(toolOverrides).length > 0) {
+            forcedPromptParams.body.tools = toolOverrides;
+        }
+        await promptWithTimeout(forcedPromptParams, requestTimeoutMs);
+        return pollForAssistantResponse(sessionId, requestTimeoutMs);
     };
 
     const TOOL_IDS_CACHE_MS = 5 * 60 * 1000;
@@ -1146,12 +1030,12 @@ export function createApp(config) {
                         };
                     };
 
-                    const externalToolRegistry = buildExternalToolRegistry(tools);
-                    const externalToolChoice = normalizeExternalToolChoice(tool_choice, externalToolRegistry);
+                    const externalToolContext = createExternalToolContext(tools, tool_choice);
+                    const externalToolRegistry = externalToolContext.registry;
+                    const externalToolChoice = externalToolContext.toolChoice;
                     const { parts, system: systemMsg, fullPromptText, lastUserMsg } = await buildPromptParts(messages, externalToolRegistry);
-                    const toolsPrompt = buildExternalToolsPrompt(externalToolRegistry, tool_choice);
                     const systemWithGuard = buildSystemPrompt(
-                        [systemMsg, toolsPrompt].filter(Boolean).join('\n\n'),
+                        [systemMsg, externalToolContext.prompt].filter(Boolean).join('\n\n'),
                         requestParams.reasoning_effort,
                         externalToolRegistry.length > 0
                     );
@@ -1211,27 +1095,17 @@ export function createApp(config) {
                         promptParams.body.tools = toolOverrides;
                     }
 
-                    const requestForcedChatToolCall = async () => {
-                        if (externalToolChoice.mode !== 'required') return null;
-                        const requiredName = externalToolChoice.requiredTool || externalToolRegistry[0]?.namespacedName;
-                        if (!requiredName) return null;
-                        const forcedPromptParams = {
-                            path: { id: sessionId },
-                            body: {
-                                model: { providerID: pID, modelID: mID },
-                                ...(systemWithGuard ? { system: systemWithGuard } : {}),
-                                parts: [{
-                                    type: 'text',
-                                    text: `SYSTEM: Your previous reply did not emit the required external tool call. Reply now with ONLY <function_calls>{\"name\":\"${requiredName}\",\"arguments\":{}}</function_calls> or an array inside <function_calls>...</function_calls>. Do not output any prose, reasoning, markdown, or <think> block. Infer the correct arguments from the conversation so far.`
-                                }]
-                            }
-                        };
-                        if (toolOverrides && Object.keys(toolOverrides).length > 0) {
-                            forcedPromptParams.body.tools = toolOverrides;
-                        }
-                        await promptWithTimeout(forcedPromptParams, REQUEST_TIMEOUT_MS);
-                        return pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                    };
+                    const requestForcedChatToolCall = createForcedToolCallRequester({
+                        mode: externalToolChoice.mode,
+                        sessionId,
+                        systemWithGuard,
+                        requiredTool: externalToolChoice.requiredTool || externalToolRegistry[0]?.namespacedName,
+                        providerID: pID,
+                        modelID: mID,
+                        toolOverrides,
+                        requestTimeoutMs: REQUEST_TIMEOUT_MS,
+                        forbidThinkBlock: true
+                    });
 
                     res.setHeader('Content-Type', stream ? 'text/event-stream' : 'application/json');
                     res.setHeader('Cache-Control', 'no-cache');
@@ -1239,8 +1113,8 @@ export function createApp(config) {
 
                     if (stream) {
                         const shouldStripStreamingToolMarkup = externalToolRegistry.length > 0;
-                        const filterContentDelta = createToolCallFilter(shouldStripStreamingToolMarkup);
-                        const filterReasoningDelta = createToolCallFilter(shouldStripStreamingToolMarkup);
+                        const filterContentDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
+                        const filterReasoningDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
                         const parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
                         const parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
                         let streamedContent = '';
@@ -1440,32 +1314,12 @@ export function createApp(config) {
                                     forcedResponse.reasoning,
                                     forcedResponse.content
                                 );
-                                if (parsedToolCalls.length > 0 && streamedToolCalls.length === 0) {
-                                    const toolCallDeltas = parsedToolCalls.map((toolCall, index) => ({
-                                        index,
-                                        id: toolCall.id,
-                                        type: 'function',
-                                        function: {
-                                            name: toolCall.function.name,
-                                            arguments: toolCall.function.arguments
-                                        }
-                                    }));
-                                    res.write(`data: ${JSON.stringify({
-                                        id,
-                                        object: 'chat.completion.chunk',
-                                        created: Math.floor(Date.now() / 1000),
-                                        model: `${pID}/${mID}`,
-                                        choices: [{
-                                            index: 0,
-                                            delta: { tool_calls: toolCallDeltas },
-                                            finish_reason: null
-                                        }]
-                                    })}\n\n`);
-                                }
                             }
                         }
-                        if (parsedToolCalls.length > 0 && streamedToolCalls.length === 0) {
-                            const toolCallDeltas = parsedToolCalls.map((toolCall, index) => ({
+                        const { validCalls: validatedStreamedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
+                        const finalStreamedToolCalls = validatedStreamedToolCalls;
+                        if (finalStreamedToolCalls.length > 0 && streamedToolCalls.length === 0) {
+                            const toolCallDeltas = finalStreamedToolCalls.map((toolCall, index) => ({
                                 index,
                                 id: toolCall.id,
                                 type: 'function',
@@ -1494,7 +1348,7 @@ export function createApp(config) {
                         
                         res.write(`data: ${JSON.stringify({ 
                             id, 
-                            choices: [{ index: 0, delta: {}, finish_reason: parsedToolCalls.length > 0 ? 'tool_calls' : 'stop' }],
+                            choices: [{ index: 0, delta: {}, finish_reason: finalStreamedToolCalls.length > 0 ? 'tool_calls' : 'stop' }],
                             usage: {
                                 prompt_tokens: promptTokens,
                                 completion_tokens: completionTokens + reasoningTokens,
@@ -1530,6 +1384,7 @@ export function createApp(config) {
                                 parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
                             }
                         }
+                        const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
                         const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
                         const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
 
@@ -1543,11 +1398,12 @@ export function createApp(config) {
                             finalContent = `<think>\n${safeReasoning}\n</think>\n\n${safeContent}`;
                         }
 
-                        const assistantMessage = parsedToolCalls.length > 0
+                        const publicValidatedToolCalls = toPublicToolCalls(validatedToolCalls);
+                        const assistantMessage = publicValidatedToolCalls.length > 0
                             ? {
                                 role: 'assistant',
                                 content: finalContent || null,
-                                tool_calls: parsedToolCalls
+                                tool_calls: publicValidatedToolCalls
                             }
                             : { role: 'assistant', content: finalContent };
 
@@ -1559,7 +1415,7 @@ export function createApp(config) {
                             choices: [{
                                 index: 0,
                                 message: assistantMessage,
-                                finish_reason: parsedToolCalls.length > 0 ? 'tool_calls' : 'stop'
+                                finish_reason: publicValidatedToolCalls.length > 0 ? 'tool_calls' : 'stop'
                             }],
                             usage: {
                                 prompt_tokens: promptTokens,
@@ -1673,8 +1529,9 @@ export function createApp(config) {
                 max_output_tokens 
             });
 
-            const externalToolRegistry = buildExternalToolRegistry(tools);
-            const externalToolChoice = normalizeExternalToolChoice(tool_choice, externalToolRegistry);
+            const externalToolContext = createExternalToolContext(tools, tool_choice);
+            const externalToolRegistry = externalToolContext.registry;
+            const externalToolChoice = externalToolContext.toolChoice;
             const assistantToolCalls = new Map();
 
             const rememberAssistantToolCall = (toolCallId, toolName) => {
@@ -1812,40 +1669,30 @@ export function createApp(config) {
                 if (!msg.content) continue;
                 const text = msg.role === 'tool' || String(msg.content).startsWith('ASSISTANT: ') || String(msg.content).startsWith('TOOL_RESULT: ')
                     ? msg.content
-                    : formatResponsesRoleLine(msg.role, msg.content);
+                    : msg.role === 'user'
+                        ? msg.content
+                        : formatResponsesRoleLine(msg.role, msg.content);
                 parts.push({ type: 'text', text });
                 fullPromptText += `${text}\n\n`;
             }
 
-            const toolsPrompt = buildExternalToolsPrompt(externalToolRegistry, tool_choice);
             const systemWithGuard = buildSystemPrompt(
-                [instructions, ...systemChunks, toolsPrompt].filter(Boolean).join('\n\n'),
+                [instructions, ...systemChunks, externalToolContext.prompt].filter(Boolean).join('\n\n'),
                 reasoningLevel,
                 externalToolRegistry.length > 0
             );
 
-            const requestForcedResponsesToolCall = async () => {
-                if (externalToolChoice.mode !== 'required') return null;
-                const requiredName = externalToolChoice.requiredTool || externalToolRegistry[0]?.namespacedName;
-                if (!requiredName) return null;
-                const forcedPromptParams = {
-                    path: { id: sessionId },
-                    body: {
-                        model: { providerID: pID, modelID: mID },
-                        ...(systemWithGuard ? { system: systemWithGuard } : {}),
-                        parts: [{
-                            type: 'text',
-                            text: `SYSTEM: Your previous reply did not emit the required external tool call. Reply now with ONLY <function_calls>{\"name\":\"${requiredName}\",\"arguments\":{}}</function_calls> or an array inside <function_calls>...</function_calls>. Do not output any prose, reasoning, or markdown. Infer the correct arguments from the conversation so far.`
-                        }]
-                    }
-                };
-                const toolOverrides = await getToolOverrides();
-                if (toolOverrides && Object.keys(toolOverrides).length > 0) {
-                    forcedPromptParams.body.tools = toolOverrides;
-                }
-                await promptWithTimeout(forcedPromptParams, REQUEST_TIMEOUT_MS);
-                return pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-            };
+            const requestForcedResponsesToolCall = createForcedToolCallRequester({
+                mode: externalToolChoice.mode,
+                sessionId,
+                systemWithGuard,
+                requiredTool: externalToolChoice.requiredTool || externalToolRegistry[0]?.namespacedName,
+                providerID: pID,
+                modelID: mID,
+                toolOverrides: await getToolOverrides(),
+                requestTimeoutMs: REQUEST_TIMEOUT_MS,
+                forbidThinkBlock: false
+            });
 
             const promptParams = {
                 path: { id: sessionId },
@@ -1914,8 +1761,8 @@ export function createApp(config) {
                 });
 
                 const shouldStripStreamingToolMarkup = externalToolRegistry.length > 0;
-                const filterContentDelta = createToolCallFilter(shouldStripStreamingToolMarkup);
-                const filterReasoningDelta = createToolCallFilter(shouldStripStreamingToolMarkup);
+                const filterContentDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
+                const filterReasoningDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
                 const parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
                 const parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
                 const streamedToolCalls = [];
@@ -2155,17 +2002,18 @@ export function createApp(config) {
                         );
                     }
                 }
+                const { validCalls: validatedStreamedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
                 const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
                 const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
                 if (streamedToolCalls.length === 0) {
-                    parsedToolCalls.forEach((toolCall) => {
+                    validatedStreamedToolCalls.forEach((toolCall) => {
                         emitResponsesFunctionCall(toolCall);
                     });
                 }
                 const streamOutput = [];
                 const streamMessageOutputItem = buildResponsesMessageOutputItem(safeContent && safeContent.trim() ? safeContent : '');
                 if (streamMessageOutputItem) streamOutput.push(streamMessageOutputItem);
-                parsedToolCalls.forEach((toolCall) => {
+                validatedStreamedToolCalls.forEach((toolCall) => {
                     streamOutput.push(buildResponsesFunctionCallOutputItem(toolCall));
                 });
                 const promptTokens = Math.ceil(fullPromptText.length / 4);
@@ -2196,27 +2044,39 @@ export function createApp(config) {
 
             const responseRes = await client.session.prompt(promptParams);
             const responseParts = responseRes.data?.parts || [];
+            const promptContent = responseParts.filter(p => p.type === 'text').map(p => p.text).join('\n');
+            const promptReasoning = responseParts.filter(p => p.type === 'reasoning').map(p => p.text).join('\n');
+            const promptParsedToolCalls = externalToolRegistry.length > 0
+                ? parseExternalToolCallsFromText(externalToolRegistry, promptReasoning, promptContent)
+                : [];
 
-            content = responseParts.filter(p => p.type === 'text').map(p => p.text).join('\n');
-            reasoning = responseParts.filter(p => p.type === 'reasoning').map(p => p.text).join('\n');
+            content = promptParsedToolCalls.length > 0 ? '' : promptContent;
+            reasoning = promptReasoning;
 
-            const polledResponse = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-            if (polledResponse.error && !polledResponse.content && !polledResponse.reasoning) {
-                throw polledResponse.error;
-            }
-            if (polledResponse.content || polledResponse.reasoning) {
+            let promptBasedToolCalls = promptParsedToolCalls;
+            const shouldPollForResponses = !promptContent && !promptReasoning;
+            if (shouldPollForResponses) {
+                const polledResponse = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                if (polledResponse.error && !polledResponse.content && !polledResponse.reasoning) {
+                    throw polledResponse.error;
+                }
                 content = polledResponse.content || content;
                 reasoning = polledResponse.reasoning || reasoning;
+                promptBasedToolCalls = externalToolRegistry.length > 0
+                    ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
+                    : [];
             }
 
-            if (!content && !reasoning && responseRes.data) {
+            if (!content && !reasoning && responseRes.data && promptBasedToolCalls.length === 0) {
                 const data = responseRes.data;
                 content = typeof data === 'string' ? data : data?.message || JSON.stringify(data);
             }
 
-            let parsedToolCalls = externalToolRegistry.length > 0
-                ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
-                : [];
+            let parsedToolCalls = promptBasedToolCalls.length > 0
+                ? promptBasedToolCalls
+                : (externalToolRegistry.length > 0
+                    ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
+                    : []);
             if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
                 const forcedResponse = await requestForcedResponsesToolCall();
                 if (forcedResponse) {
@@ -2225,6 +2085,7 @@ export function createApp(config) {
                     parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
                 }
             }
+            const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
             const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
             const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
 
@@ -2234,7 +2095,7 @@ export function createApp(config) {
             const output = [];
             const messageOutputItem = buildResponsesMessageOutputItem(safeContent);
             if (messageOutputItem) output.push(messageOutputItem);
-            parsedToolCalls.forEach((toolCall) => {
+            validatedToolCalls.forEach((toolCall) => {
                 output.push(buildResponsesFunctionCallOutputItem(toolCall));
             });
 
