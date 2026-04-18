@@ -1,6 +1,62 @@
 import request from 'supertest';
 import { jest } from '@jest/globals';
 
+const sdkMocks = {
+    configProviders: jest.fn(async () => ({
+        data: {
+            providers: [
+                {
+                    id: 'opencode',
+                    models: {
+                        'kimi-k2.5': { name: 'Kimi k2.5', release_date: '2024-01-15' },
+                        'gpt-5-nano': { name: 'GPT-5 Nano', release_date: '2025-01-15' }
+                    }
+                }
+            ]
+        }
+    })),
+    configUpdate: jest.fn(async () => ({})),
+    sessionCreate: jest.fn(async () => ({
+        data: { id: 'test-session-id' }
+    })),
+    sessionPrompt: jest.fn(async (args) => {
+        const promptText = args.body.prompt || args.body.parts?.map(part => part.text || '').join(' ') || '';
+        const parts = [{ type: 'text', text: 'Mock response' }];
+
+        if (promptText.includes('reasoning')) {
+            parts.unshift({ type: 'reasoning', text: 'Thinking process...' });
+        }
+
+        return { data: { parts } };
+    }),
+    sessionMessages: jest.fn(async () => ([
+        {
+            info: { role: 'assistant', finish: 'stop' },
+            parts: [
+                { type: 'text', text: 'Mock response' }
+            ]
+        }
+    ])),
+    sessionDelete: jest.fn(async () => ({})),
+    eventSubscribe: jest.fn(async () => {
+        const sessionId = 'test-session-id';
+        const mockEvents = [
+            { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'Thinking...' } },
+            { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: 'Mock' } },
+            { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: ' response' } },
+            { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
+        ];
+
+        return {
+            stream: (async function* () {
+                for (const event of mockEvents) {
+                    yield event;
+                }
+            })()
+        };
+    })
+};
+
 jest.unstable_mockModule('https', () => ({
     default: {
         get: jest.fn((url, options, callback) => {
@@ -21,66 +77,40 @@ jest.unstable_mockModule('https', () => ({
     }
 }));
 
+jest.unstable_mockModule('http', () => ({
+    default: {
+        get: jest.fn((url, options, callback) => {
+            const response = {
+                statusCode: 200,
+                headers: {},
+                on: jest.fn()
+            };
+
+            callback(response);
+
+            return {
+                on: jest.fn(),
+                destroy: jest.fn(),
+                setTimeout: jest.fn()
+            };
+        })
+    }
+}));
+
 jest.unstable_mockModule('@opencode-ai/sdk', () => ({
     createOpencodeClient: jest.fn(() => ({
         config: {
-            providers: jest.fn(async () => ({
-                data: {
-                    providers: [
-                        {
-                            id: 'opencode',
-                            models: {
-                                'kimi-k2.5': { name: 'Kimi k2.5', release_date: '2024-01-15' },
-                                'gpt-5-nano': { name: 'GPT-5 Nano', release_date: '2025-01-15' }
-                            }
-                        }
-                    ]
-                }
-            })),
-            update: jest.fn(async () => ({}))
+            providers: sdkMocks.configProviders,
+            update: sdkMocks.configUpdate
         },
         session: {
-            create: jest.fn(async () => ({
-                data: { id: 'test-session-id' }
-            })),
-            prompt: jest.fn(async (args) => {
-                const promptText = args.body.prompt || args.body.parts?.map(part => part.text || '').join(' ') || '';
-                const parts = [{ type: 'text', text: 'Mock response' }];
-                
-                if (promptText.includes('reasoning')) {
-                    parts.unshift({ type: 'reasoning', text: 'Thinking process...' });
-                }
-                
-                return { data: { parts } };
-            }),
-            messages: jest.fn(async () => ([
-                {
-                    info: { role: 'assistant', finish: 'stop' },
-                    parts: [
-                        { type: 'text', text: 'Mock response' }
-                    ]
-                }
-            ])),
-            delete: jest.fn(async () => ({}))
+            create: sdkMocks.sessionCreate,
+            prompt: sdkMocks.sessionPrompt,
+            messages: sdkMocks.sessionMessages,
+            delete: sdkMocks.sessionDelete
         },
         event: {
-            subscribe: jest.fn(async () => {
-                const sessionId = 'test-session-id';
-                const mockEvents = [
-                    { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'Thinking...' } },
-                    { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: 'Mock' } },
-                    { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: ' response' } },
-                    { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
-                ];
-
-                return {
-                    stream: (async function* () {
-                        for (const event of mockEvents) {
-                            yield event;
-                        }
-                    })()
-                };
-            })
+            subscribe: sdkMocks.eventSubscribe
         }
     }))
 }));
@@ -96,6 +126,7 @@ describe('Proxy OpenAI API', () => {
     });
 
     beforeEach(() => {
+        jest.clearAllMocks();
         const config = {
             PORT: 10000,
             API_KEY: 'test-key',
@@ -106,6 +137,226 @@ describe('Proxy OpenAI API', () => {
         };
         const result = createApp(config);
         app = result.app;
+    });
+
+    test('POST /v1/chat/completions keeps normal non-tool responses unchanged when no external tools are provided', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    { type: 'text', text: 'Plain assistant reply' }
+                ]
+            }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Hello' }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.object).toEqual('chat.completion');
+        expect(res.body.choices[0].finish_reason).toEqual('stop');
+        expect(res.body.choices[0].message).toEqual({
+            role: 'assistant',
+            content: 'Plain assistant reply'
+        });
+        expect(res.body.choices[0].message.tool_calls).toBeUndefined();
+    });
+
+    test('POST /v1/chat/completions returns OpenAI-compatible tool_calls for external tools', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    {
+                        type: 'text',
+                        text: '<function_calls>[{"id":"call_weather_1","name":"weather_lookup","arguments":{"city":"Tokyo","unit":"celsius"}}]</function_calls>'
+                    }
+                ]
+            }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'What is the weather in Tokyo?' }],
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'weather_lookup',
+                            description: 'Look up weather by city',
+                            parameters: {
+                                type: 'object',
+                                properties: {
+                                    city: { type: 'string' },
+                                    unit: { type: 'string' }
+                                },
+                                required: ['city']
+                            }
+                        }
+                    }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.choices[0].finish_reason).toEqual('tool_calls');
+        expect(res.body.choices[0].message.role).toEqual('assistant');
+        expect(res.body.choices[0].message.content).toBeNull();
+        expect(res.body.choices[0].message.tool_calls).toEqual([
+            {
+                id: 'call_weather_1',
+                type: 'function',
+                function: {
+                    name: 'weather_lookup',
+                    arguments: JSON.stringify({ city: 'Tokyo', unit: 'celsius' })
+                }
+            }
+        ]);
+
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).toContain('External tools are virtualized by this proxy. They are not OpenCode tools.');
+        expect(promptCall.body.system).toContain('external__weather_lookup');
+        expect(promptCall.body.system).toContain('client_name');
+    });
+
+    test('POST /v1/chat/completions keeps external web_fetch isolated from internal tool semantics', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    {
+                        type: 'text',
+                        text: '<function_calls>[{"id":"call_web_fetch_1","name":"web_fetch","arguments":{"url":"https://example.com"}}]</function_calls>'
+                    }
+                ]
+            }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Fetch https://example.com' }],
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'web_fetch',
+                            description: 'External fetch tool',
+                            parameters: {
+                                type: 'object',
+                                properties: {
+                                    url: { type: 'string' }
+                                },
+                                required: ['url']
+                            }
+                        }
+                    }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.choices[0].finish_reason).toEqual('tool_calls');
+        expect(res.body.choices[0].message.tool_calls).toEqual([
+            {
+                id: 'call_web_fetch_1',
+                type: 'function',
+                function: {
+                    name: 'web_fetch',
+                    arguments: JSON.stringify({ url: 'https://example.com' })
+                }
+            }
+        ]);
+
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).toContain('Use only the namespaced names listed below. Do not use original client tool names inside function calls.');
+        expect(promptCall.body.system).toContain('external__web_fetch');
+        expect(promptCall.body.tools).toBeUndefined();
+    });
+
+    test('POST /v1/chat/completions continues after tool result messages with matching tool_call_id', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    { type: 'text', text: 'The weather in Tokyo is 22°C and sunny.' }
+                ]
+            }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'weather_lookup',
+                            description: 'Look up weather by city',
+                            parameters: {
+                                type: 'object',
+                                properties: { city: { type: 'string' } },
+                                required: ['city']
+                            }
+                        }
+                    }
+                ],
+                messages: [
+                    { role: 'user', content: 'What is the weather in Tokyo?' },
+                    {
+                        role: 'assistant',
+                        content: null,
+                        tool_calls: [
+                            {
+                                id: 'call_weather_1',
+                                type: 'function',
+                                function: {
+                                    name: 'weather_lookup',
+                                    arguments: JSON.stringify({ city: 'Tokyo' })
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        role: 'tool',
+                        tool_call_id: 'call_weather_1',
+                        content: '22°C and sunny',
+                        name: 'weather_lookup'
+                    }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.choices[0].finish_reason).toEqual('stop');
+        expect(res.body.choices[0].message).toEqual({
+            role: 'assistant',
+            content: 'The weather in Tokyo is 22°C and sunny.'
+        });
+
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.parts).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                type: 'text',
+                text: expect.stringContaining('ASSISTANT: <function_calls>')
+            }),
+            expect.objectContaining({
+                type: 'text',
+                text: 'TOOL_RESULT: {"tool_call_id":"call_weather_1","name":"external__weather_lookup","content":"22°C and sunny"}'
+            })
+        ]));
+        expect(promptCall.body.parts[1].text).toContain('external__weather_lookup');
+        expect(promptCall.body.parts[1].text).toContain('call_weather_1');
+        expect(promptCall.body.parts[1].text).toContain('{\\"city\\":\\"Tokyo\\"}');
     });
 
     test('GET /health returns status ok', async () => {
@@ -182,6 +433,130 @@ describe('Proxy OpenAI API', () => {
         expect(res.text).not.toContain('reasoning_content');
     });
 
+    test('POST /v1/chat/completions streaming emits tool_call chunks for external tools without leaking raw function markup', async () => {
+        sdkMocks.eventSubscribe.mockResolvedValueOnce({
+            stream: (async function* () {
+                const sessionId = 'test-session-id';
+                yield {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { type: 'reasoning', sessionID: sessionId },
+                        delta: 'Thinking...'
+                    }
+                };
+                yield {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { type: 'text', sessionID: sessionId },
+                        delta: '<function_calls>[{"id":"call_weather_stream_1","name":"external__weather_lookup","arguments":'
+                    }
+                };
+                yield {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { type: 'text', sessionID: sessionId },
+                        delta: '{"city":"Tokyo","unit":"celsius"}}]</function_calls>'
+                    }
+                };
+                yield {
+                    type: 'message.updated',
+                    properties: { info: { sessionID: sessionId, finish: 'stop' } }
+                };
+            })()
+        });
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'What is the weather in Tokyo?' }],
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'weather_lookup',
+                            description: 'Look up weather by city',
+                            parameters: {
+                                type: 'object',
+                                properties: {
+                                    city: { type: 'string' },
+                                    unit: { type: 'string' }
+                                },
+                                required: ['city']
+                            }
+                        }
+                    }
+                ],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.header['content-type']).toContain('text/event-stream');
+        expect(res.text).toContain('<think>');
+        expect(res.text).toContain('"tool_calls":[{"index":0,"id":"call_weather_stream_1","type":"function","function":{"name":"weather_lookup"');
+        expect(res.text).toContain('"arguments":"{\\"city\\":\\"Tokyo\\",\\"unit\\":\\"celsius\\"}"');
+        expect(res.text).toContain('"finish_reason":"tool_calls"');
+        expect(res.text).not.toContain('<function_calls>');
+        expect(res.text).not.toContain('external__weather_lookup');
+        expect(res.text).toContain('data: [DONE]');
+    });
+
+    test('POST /v1/chat/completions streaming preserves same-name collision isolation for external tools', async () => {
+        sdkMocks.eventSubscribe.mockResolvedValueOnce({
+            stream: (async function* () {
+                const sessionId = 'test-session-id';
+                yield {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { type: 'text', sessionID: sessionId },
+                        delta: '<function_calls>[{"id":"call_collision_1","name":"external__web_fetch_2","arguments":{"url":"https://example.com/collision"}}]</function_calls>'
+                    }
+                };
+                yield {
+                    type: 'message.updated',
+                    properties: { info: { sessionID: sessionId, finish: 'stop' } }
+                };
+            })()
+        });
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Use the second web_fetch tool' }],
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'web_fetch',
+                            description: 'First external fetch tool',
+                            parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }
+                        }
+                    },
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'web_fetch',
+                            description: 'Second external fetch tool',
+                            parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }
+                        }
+                    }
+                ],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.text).toContain('"tool_calls":[{"index":0,"id":"call_collision_1","type":"function","function":{"name":"web_fetch"');
+        expect(res.text).toContain('https://example.com/collision');
+        expect(res.text).not.toContain('external__web_fetch_2');
+        expect(res.text).not.toContain('<function_calls>');
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).toContain('external__web_fetch');
+        expect(promptCall.body.system).toContain('external__web_fetch_2');
+    });
+
     test('POST /v1/chat/completions supports multimodal content', async () => {
         const res = await request(app)
             .post('/v1/chat/completions')
@@ -251,6 +626,202 @@ describe('Proxy OpenAI API', () => {
         expect(res.body.output[0].content[0].text).toBeDefined();
     });
 
+    test('POST /v1/responses returns external function_call output items for non-stream requests', async () => {
+        sdkMocks.sessionPrompt.mockResolvedValueOnce({
+            data: {
+                parts: [
+                    {
+                        type: 'text',
+                        text: '<function_calls>[{"id":"resp_call_weather_1","name":"external__weather_lookup","arguments":{"city":"Tokyo","unit":"celsius"}}]</function_calls>'
+                    }
+                ]
+            }
+        });
+
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'What is the weather in Tokyo?',
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'weather_lookup',
+                            description: 'Look up weather by city',
+                            parameters: {
+                                type: 'object',
+                                properties: {
+                                    city: { type: 'string' },
+                                    unit: { type: 'string' }
+                                },
+                                required: ['city']
+                            }
+                        }
+                    }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.object).toEqual('response');
+        expect(res.body.output).toEqual([
+            {
+                type: 'function_call',
+                status: 'completed',
+                id: 'resp_call_weather_1',
+                call_id: 'resp_call_weather_1',
+                name: 'weather_lookup',
+                arguments: JSON.stringify({ city: 'Tokyo', unit: 'celsius' })
+            }
+        ]);
+
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).toContain('External tools are virtualized by this proxy. They are not OpenCode tools.');
+        expect(promptCall.body.system).toContain('external__weather_lookup');
+        expect(promptCall.body.system).toContain('client_name');
+    });
+
+    test('POST /v1/responses keeps external web_fetch isolated from internal tool semantics', async () => {
+        sdkMocks.sessionPrompt.mockResolvedValueOnce({
+            data: {
+                parts: [
+                    {
+                        type: 'text',
+                        text: '<function_calls>[{"id":"resp_call_web_fetch_1","name":"external__web_fetch","arguments":{"url":"https://example.com"}}]</function_calls>'
+                    }
+                ]
+            }
+        });
+
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'Fetch https://example.com',
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'web_fetch',
+                            description: 'External fetch tool',
+                            parameters: {
+                                type: 'object',
+                                properties: {
+                                    url: { type: 'string' }
+                                },
+                                required: ['url']
+                            }
+                        }
+                    }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.output).toEqual([
+            {
+                type: 'function_call',
+                status: 'completed',
+                id: 'resp_call_web_fetch_1',
+                call_id: 'resp_call_web_fetch_1',
+                name: 'web_fetch',
+                arguments: JSON.stringify({ url: 'https://example.com' })
+            }
+        ]);
+
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).toContain('Use only the namespaced names listed below. Do not use original client tool names inside function calls.');
+        expect(promptCall.body.system).toContain('external__web_fetch');
+        expect(promptCall.body.tools).toBeUndefined();
+    });
+
+    test('POST /v1/responses continues after function_call_output input and returns assistant text', async () => {
+        sdkMocks.sessionPrompt.mockResolvedValueOnce({
+            data: {
+                parts: [
+                    { type: 'text', text: 'The weather in Tokyo is 22°C and sunny.' }
+                ]
+            }
+        });
+
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'weather_lookup',
+                            description: 'Look up weather by city',
+                            parameters: {
+                                type: 'object',
+                                properties: { city: { type: 'string' } },
+                                required: ['city']
+                            }
+                        }
+                    }
+                ],
+                input: [
+                    {
+                        type: 'message',
+                        role: 'user',
+                        content: [
+                            { type: 'input_text', text: 'What is the weather in Tokyo?' }
+                        ]
+                    },
+                    {
+                        type: 'function_call',
+                        call_id: 'resp_call_weather_1',
+                        name: 'weather_lookup',
+                        arguments: { city: 'Tokyo' }
+                    },
+                    {
+                        type: 'function_call_output',
+                        call_id: 'resp_call_weather_1',
+                        output: '22°C and sunny'
+                    }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.object).toEqual('response');
+        expect(res.body.output).toEqual([
+            {
+                type: 'message',
+                role: 'assistant',
+                status: 'completed',
+                content: [
+                    {
+                        type: 'output_text',
+                        text: 'The weather in Tokyo is 22°C and sunny.'
+                    }
+                ]
+            }
+        ]);
+
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.parts).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                type: 'text',
+                text: 'What is the weather in Tokyo?'
+            }),
+            expect.objectContaining({
+                type: 'text',
+                text: expect.stringContaining('ASSISTANT: <function_calls>')
+            }),
+            expect.objectContaining({
+                type: 'text',
+                text: 'TOOL_RESULT: {"tool_call_id":"resp_call_weather_1","name":"external__weather_lookup","content":"22°C and sunny"}'
+            })
+        ]));
+        expect(promptCall.body.parts[1].text).toContain('external__weather_lookup');
+        expect(promptCall.body.parts[1].text).toContain('resp_call_weather_1');
+        expect(promptCall.body.parts[1].text).toContain('{\\"city\\":\\"Tokyo\\"}');
+    });
+
     test('POST /v1/chat/completions falls back to first available model when model is omitted', async () => {
         const res = await request(app)
             .post('/v1/chat/completions')
@@ -281,6 +852,125 @@ describe('Proxy OpenAI API', () => {
         expect(res.text).toContain('response.output_item.done');
         expect(res.text).toContain('response.completed');
         expect(res.text).toContain('data: [DONE]');
+    });
+
+    test('POST /v1/responses streaming emits function_call output items for external tools without leaking raw function markup', async () => {
+        sdkMocks.eventSubscribe.mockResolvedValueOnce({
+            stream: (async function* () {
+                const sessionId = 'test-session-id';
+                yield {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { type: 'reasoning', sessionID: sessionId },
+                        delta: 'Thinking...'
+                    }
+                };
+                yield {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { type: 'text', sessionID: sessionId },
+                        delta: '<function_calls>[{"id":"resp_call_weather_stream_1","name":"external__weather_lookup","arguments":{"city":"Tokyo","unit":"celsius"}}]</function_calls>'
+                    }
+                };
+                yield {
+                    type: 'message.updated',
+                    properties: { info: { sessionID: sessionId, finish: 'stop' } }
+                };
+            })()
+        });
+
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'What is the weather in Tokyo?',
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'weather_lookup',
+                            description: 'Look up weather by city',
+                            parameters: {
+                                type: 'object',
+                                properties: {
+                                    city: { type: 'string' },
+                                    unit: { type: 'string' }
+                                },
+                                required: ['city']
+                            }
+                        }
+                    }
+                ],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.header['content-type']).toContain('text/event-stream');
+        expect(res.text).toContain('response.reasoning_summary_text.delta');
+        expect(res.text).toContain('response.output_item.added');
+        expect(res.text).toContain('"output_index":2,"item":{"id":"resp_call_weather_stream_1","type":"function_call","status":"in_progress","call_id":"resp_call_weather_stream_1","name":"weather_lookup"');
+        expect(res.text).toContain('"output_index":2,"item":{"id":"resp_call_weather_stream_1","type":"function_call","status":"completed","call_id":"resp_call_weather_stream_1","name":"weather_lookup"');
+        expect(res.text).toContain('"arguments":"{\\"city\\":\\"Tokyo\\",\\"unit\\":\\"celsius\\"}"');
+        expect(res.text).toContain('response.completed');
+        expect(res.text).not.toContain('<function_calls>');
+        expect(res.text).not.toContain('external__weather_lookup');
+        expect(res.text).toContain('data: [DONE]');
+    });
+
+    test('POST /v1/responses streaming preserves same-name collision isolation for external tools', async () => {
+        sdkMocks.eventSubscribe.mockResolvedValueOnce({
+            stream: (async function* () {
+                const sessionId = 'test-session-id';
+                yield {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { type: 'text', sessionID: sessionId },
+                        delta: '<function_calls>[{"id":"resp_call_collision_1","name":"external__web_fetch_2","arguments":{"url":"https://example.com/collision"}}]</function_calls>'
+                    }
+                };
+                yield {
+                    type: 'message.updated',
+                    properties: { info: { sessionID: sessionId, finish: 'stop' } }
+                };
+            })()
+        });
+
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'Use the second web_fetch tool',
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'web_fetch',
+                            description: 'First external fetch tool',
+                            parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }
+                        }
+                    },
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'web_fetch',
+                            description: 'Second external fetch tool',
+                            parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }
+                        }
+                    }
+                ],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.text).toContain('"output_index":2,"item":{"id":"resp_call_collision_1","type":"function_call","status":"completed","call_id":"resp_call_collision_1","name":"web_fetch"');
+        expect(res.text).toContain('https://example.com/collision');
+        expect(res.text).not.toContain('external__web_fetch_2');
+        expect(res.text).not.toContain('<function_calls>');
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).toContain('external__web_fetch');
+        expect(promptCall.body.system).toContain('external__web_fetch_2');
     });
 
     test('POST /v1/responses supports OpenAI reasoning object and unhyphenated GPT model aliases', async () => {
