@@ -1147,6 +1147,7 @@ export function createApp(config) {
                     };
 
                     const externalToolRegistry = buildExternalToolRegistry(tools);
+                    const externalToolChoice = normalizeExternalToolChoice(tool_choice, externalToolRegistry);
                     const { parts, system: systemMsg, fullPromptText, lastUserMsg } = await buildPromptParts(messages, externalToolRegistry);
                     const toolsPrompt = buildExternalToolsPrompt(externalToolRegistry, tool_choice);
                     const systemWithGuard = buildSystemPrompt(
@@ -1209,6 +1210,28 @@ export function createApp(config) {
                     if (toolOverrides && Object.keys(toolOverrides).length > 0) {
                         promptParams.body.tools = toolOverrides;
                     }
+
+                    const requestForcedChatToolCall = async () => {
+                        if (externalToolChoice.mode !== 'required') return null;
+                        const requiredName = externalToolChoice.requiredTool || externalToolRegistry[0]?.namespacedName;
+                        if (!requiredName) return null;
+                        const forcedPromptParams = {
+                            path: { id: sessionId },
+                            body: {
+                                model: { providerID: pID, modelID: mID },
+                                ...(systemWithGuard ? { system: systemWithGuard } : {}),
+                                parts: [{
+                                    type: 'text',
+                                    text: `SYSTEM: Your previous reply did not emit the required external tool call. Reply now with ONLY <function_calls>{\"name\":\"${requiredName}\",\"arguments\":{}}</function_calls> or an array inside <function_calls>...</function_calls>. Do not output any prose, reasoning, markdown, or <think> block. Infer the correct arguments from the conversation so far.`
+                                }]
+                            }
+                        };
+                        if (toolOverrides && Object.keys(toolOverrides).length > 0) {
+                            forcedPromptParams.body.tools = toolOverrides;
+                        }
+                        await promptWithTimeout(forcedPromptParams, REQUEST_TIMEOUT_MS);
+                        return pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                    };
 
                     res.setHeader('Content-Type', stream ? 'text/event-stream' : 'application/json');
                     res.setHeader('Cache-Control', 'no-cache');
@@ -1404,11 +1427,43 @@ export function createApp(config) {
                             })}\n\n`);
                         }
 
-                        const parsedToolCalls = streamedToolCalls.length > 0
+                        let parsedToolCalls = streamedToolCalls.length > 0
                             ? streamedToolCalls
                             : (externalToolRegistry.length > 0
                                 ? parseExternalToolCallsFromText(externalToolRegistry, rawStreamedReasoning, rawStreamedContent)
                                 : []);
+                        if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                            const forcedResponse = await requestForcedChatToolCall();
+                            if (forcedResponse) {
+                                parsedToolCalls = parseExternalToolCallsFromText(
+                                    externalToolRegistry,
+                                    forcedResponse.reasoning,
+                                    forcedResponse.content
+                                );
+                                if (parsedToolCalls.length > 0 && streamedToolCalls.length === 0) {
+                                    const toolCallDeltas = parsedToolCalls.map((toolCall, index) => ({
+                                        index,
+                                        id: toolCall.id,
+                                        type: 'function',
+                                        function: {
+                                            name: toolCall.function.name,
+                                            arguments: toolCall.function.arguments
+                                        }
+                                    }));
+                                    res.write(`data: ${JSON.stringify({
+                                        id,
+                                        object: 'chat.completion.chunk',
+                                        created: Math.floor(Date.now() / 1000),
+                                        model: `${pID}/${mID}`,
+                                        choices: [{
+                                            index: 0,
+                                            delta: { tool_calls: toolCallDeltas },
+                                            finish_reason: null
+                                        }]
+                                    })}\n\n`);
+                                }
+                            }
+                        }
                         if (parsedToolCalls.length > 0 && streamedToolCalls.length === 0) {
                             const toolCallDeltas = parsedToolCalls.map((toolCall, index) => ({
                                 index,
@@ -1455,7 +1510,7 @@ export function createApp(config) {
                         const promptStart = Date.now();
                         await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
                         logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
-                        const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                        let { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
                         if (error && !content && !reasoning) {
                             return res.status(502).json({
                                 error: {
@@ -1464,9 +1519,17 @@ export function createApp(config) {
                                 }
                             });
                         }
-                        const parsedToolCalls = externalToolRegistry.length > 0
+                        let parsedToolCalls = externalToolRegistry.length > 0
                             ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
                             : [];
+                        if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                            const forcedResponse = await requestForcedChatToolCall();
+                            if (forcedResponse) {
+                                content = forcedResponse.content || content;
+                                reasoning = forcedResponse.reasoning || reasoning;
+                                parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
+                            }
+                        }
                         const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
                         const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
 
