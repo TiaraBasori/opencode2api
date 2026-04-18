@@ -1,7 +1,7 @@
 # OpenCode2API 文档中心
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.5.0-blue" alt="Version">
 </p>
 
 > 欢迎查看 OpenCode2API 文档
