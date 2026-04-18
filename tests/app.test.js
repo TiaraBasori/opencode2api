@@ -1,5 +1,9 @@
 import request from 'supertest';
 import { jest } from '@jest/globals';
+import { buildExternalToolRegistry } from '../src/tool-runtime/registry.js';
+import { normalizeExternalToolChoice, buildToolExposure } from '../src/tool-runtime/router.js';
+import { evaluateToolPolicy } from '../src/tool-runtime/policy.js';
+import { validateToolCall, validateToolCalls } from '../src/tool-runtime/validator.js';
 
 const sdkMocks = {
     configProviders: jest.fn(async () => ({
@@ -1004,14 +1008,265 @@ describe('Proxy OpenAI API', () => {
         expect(res.text).toContain('"effort":"high"');
     });
 
-    test('Rejects requests without valid API key', async () => {
+    test('runtime validator rejects malformed JSON arguments as repairable', () => {
+        const registry = buildExternalToolRegistry([
+            {
+                type: 'function',
+                function: {
+                    name: 'weather_lookup',
+                    description: 'Look up weather by city',
+                    parameters: {
+                        type: 'object',
+                        properties: { city: { type: 'string' } },
+                        required: ['city']
+                    }
+                }
+            }
+        ]);
+
+        const result = validateToolCall({
+            type: 'function',
+            function: {
+                name: 'weather_lookup',
+                arguments: '{"city":"Tokyo"'
+            }
+        }, registry);
+
+        expect(result.status).toEqual('repairable');
+        expect(result.errors[0].code).toEqual('invalid_arguments_json');
+    });
+
+    test('runtime validator rejects missing required fields and invalid enums', () => {
+        const registry = buildExternalToolRegistry([
+            {
+                type: 'function',
+                function: {
+                    name: 'weather_lookup',
+                    description: 'Look up weather by city',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            city: { type: 'string' },
+                            unit: { type: 'string', enum: ['celsius', 'fahrenheit'] }
+                        },
+                        required: ['city']
+                    }
+                }
+            }
+        ]);
+
+        const missingField = validateToolCall({
+            type: 'function',
+            function: {
+                name: 'weather_lookup',
+                arguments: JSON.stringify({ unit: 'kelvin' })
+            }
+        }, registry);
+
+        expect(missingField.status).toEqual('rejected');
+        expect(missingField.errors.map((error) => error.code)).toEqual(expect.arrayContaining(['missing_required_field', 'invalid_enum']));
+    });
+
+    test('runtime validator normalizes valid arguments and separates invalid calls', () => {
+        const registry = buildExternalToolRegistry([
+            {
+                type: 'function',
+                function: {
+                    name: 'weather_lookup',
+                    description: 'Look up weather by city',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            city: { type: 'string' },
+                            unit: { type: 'string' }
+                        },
+                        required: ['city']
+                    }
+                }
+            }
+        ]);
+
+        const { validCalls, invalidCalls } = validateToolCalls([
+            {
+                id: 'valid_call',
+                type: 'function',
+                function: {
+                    name: 'weather_lookup',
+                    arguments: { city: 'Tokyo', unit: 'celsius' }
+                }
+            },
+            {
+                id: 'invalid_call',
+                type: 'function',
+                function: {
+                    name: 'weather_lookup',
+                    arguments: JSON.stringify({ unit: 'celsius' })
+                }
+            }
+        ], registry);
+
+        expect(validCalls).toHaveLength(1);
+        expect(validCalls[0].function.arguments).toEqual(JSON.stringify({ city: 'Tokyo', unit: 'celsius' }));
+        expect(validCalls[0].validatedArguments).toEqual({ city: 'Tokyo', unit: 'celsius' });
+        expect(invalidCalls).toHaveLength(1);
+        expect(invalidCalls[0].validation.status).toEqual('rejected');
+    });
+
+    test('runtime policy enforces denylist, confirmation, and allowlist overrides', () => {
+        const registry = buildExternalToolRegistry([
+            {
+                type: 'function',
+                x_proxy_side_effect: 'delete',
+                function: {
+                    name: 'delete_ticket',
+                    description: 'Delete a ticket',
+                    parameters: {
+                        type: 'object',
+                        properties: { id: { type: 'string' } },
+                        required: ['id']
+                    }
+                }
+            }
+        ]);
+        const [tool] = registry;
+
+        const denied = evaluateToolPolicy(tool, { id: '123' }, {
+            config: { EXTERNAL_TOOL_DENYLIST: ['delete_ticket'] }
+        });
+        expect(denied.status).toEqual('deny');
+        expect(denied.code).toEqual('tool_denied_by_policy');
+
+        const requiresConfirmation = evaluateToolPolicy(tool, { id: '123' }, { config: {} });
+        expect(requiresConfirmation.status).toEqual('require_confirmation');
+        expect(requiresConfirmation.confirmationPayload.toolName).toEqual('delete_ticket');
+
+        const allowed = evaluateToolPolicy(tool, { id: '123' }, {
+            config: { EXTERNAL_TOOL_ALLOWLIST: ['delete_ticket'] }
+        });
+        expect(allowed.status).toEqual('allow');
+    });
+
+    test('runtime router exposes mapped required tool names and prompt metadata', () => {
+        const registry = buildExternalToolRegistry([
+            {
+                type: 'function',
+                function: {
+                    name: 'weather_lookup',
+                    description: 'Look up weather by city',
+                    parameters: {
+                        type: 'object',
+                        properties: { city: { type: 'string' } },
+                        required: ['city']
+                    }
+                }
+            }
+        ]);
+
+        const normalizedChoice = normalizeExternalToolChoice({
+            type: 'function',
+            function: { name: 'weather_lookup' }
+        }, registry);
+        expect(normalizedChoice).toEqual({
+            mode: 'required',
+            requiredTool: 'external__weather_lookup'
+        });
+
+        const exposure = buildToolExposure(registry, 'required');
+        expect(exposure.toolChoice.mode).toEqual('required');
+        expect(exposure.prompt).toContain('risk_level');
+        expect(exposure.prompt).toContain('requires_confirmation');
+        expect(exposure.prompt).toContain('external__weather_lookup');
+    });
+
+    test('POST /v1/chat/completions drops invalid external tool calls instead of leaking malformed tool_calls', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    {
+                        type: 'text',
+                        text: '<function_calls>[{"id":"call_invalid_weather","name":"weather_lookup","arguments":{"unit":"celsius"}}]</function_calls>'
+                    }
+                ]
+            }
+        ]);
+
         const res = await request(app)
             .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
             .send({
                 model: 'opencode/kimi-k2.5',
-                messages: [{ role: 'user', content: 'Hello' }]
+                messages: [{ role: 'user', content: 'What is the weather in Tokyo?' }],
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'weather_lookup',
+                            description: 'Look up weather by city',
+                            parameters: {
+                                type: 'object',
+                                properties: {
+                                    city: { type: 'string' },
+                                    unit: { type: 'string' }
+                                },
+                                required: ['city']
+                            }
+                        }
+                    }
+                ]
             });
 
-        expect(res.statusCode).toEqual(401);
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.choices[0].finish_reason).toEqual('stop');
+        expect(res.body.choices[0].message.tool_calls).toBeUndefined();
+        expect(res.body.choices[0].message.content).toEqual('');
+    });
+
+    test('POST /v1/responses drops denied external tool calls from non-stream output', async () => {
+        const restrictedApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: false,
+            DEBUG: false,
+            EXTERNAL_TOOL_DENYLIST: ['delete_ticket']
+        }).app;
+
+        sdkMocks.sessionPrompt.mockResolvedValueOnce({
+            data: {
+                parts: [
+                    {
+                        type: 'text',
+                        text: '<function_calls>[{"id":"resp_call_delete_1","name":"external__delete_ticket","arguments":{"id":"123"}}]</function_calls>'
+                    }
+                ]
+            }
+        });
+
+        const res = await request(restrictedApp)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'Delete ticket 123',
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'delete_ticket',
+                            description: 'Delete a ticket',
+                            parameters: {
+                                type: 'object',
+                                properties: { id: { type: 'string' } },
+                                required: ['id']
+                            }
+                        }
+                    }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.output).toEqual([]);
     });
 });
