@@ -22,6 +22,7 @@
 | 🐳 **Docker 部署** | 一键部署，自动启动 OpenCode 后端 |
 | 🛡️ **工具安全** | 默认禁用工具调用 |
 | 🔧 **外部工具桥接** | 支持外部客户端传入 `tools`，由代理桥接为 OpenAI-compatible `tool_calls` / `function_call`，避免命中 OpenCode 内置工具 |
+| 🌐 **内置 web_fetch 透传** | 当请求未传入 `tools` 且显式开启特性时，仅允许 OpenCode 内置 `web_fetch` 参与该次请求 |
 
 ---
 
@@ -173,6 +174,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 | `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用 |
 | `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
 | `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具与 OpenCode 内置工具的冲突隔离策略；当前仅支持 `namespace` |
+| `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `false` | 当请求未传入 `tools` 时，仅放行 OpenCode 内置 `web_fetch` |
 | `USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录 |
 | `OPENCODE_PROXY_PROMPT_MODE` | `standard` | 提示词处理模式 |
 | `OPENCODE_PROXY_OMIT_SYSTEM_PROMPT` | `false` | 忽略传入的 system prompt |
@@ -196,6 +198,7 @@ OPENCODE_SERVER_PASSWORD=your-password
 DISABLE_TOOLS=true
 OPENCODE_EXTERNAL_TOOLS_MODE=proxy-bridge
 OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY=namespace
+OPENCODE_INTERNAL_WEB_FETCH_ENABLED=false
 OPENCODE_PROXY_PROMPT_MODE=plugin-inject
 OPENCODE_PROXY_OMIT_SYSTEM_PROMPT=true
 OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
@@ -207,6 +210,14 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 - 代理会把这些工具虚拟化后交给模型使用，并把模型输出重新整理为 OpenAI-compatible `tool_calls` / `function_call`。
 - 同名冲突默认通过内部命名空间隔离处理，例如客户端的 `web_fetch` 不会误触发 OpenCode 容器内工具。
 - 内部命名空间名（如 `external__web_fetch`）是代理内部实现细节，不属于公开 API。
+
+### 内置 `web_fetch` 透传说明
+
+- 仅当请求 **未传入** `tools` 且 `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` 时启用。
+- 该模式不会注入外部工具桥接协议，也不会把 OpenCode 其他内置工具暴露给模型。
+- 代理会读取后端工具列表，并仅放行名为 `web_fetch`（或以 `.web_fetch` / `/web_fetch` 结尾）的内置工具，其余工具统一禁用。
+- 如果后端未提供 `web_fetch`，代理会回退到“全部内置工具禁用”的安全模式。
+- 一旦客户端显式传入 `tools`，请求立即回到现有外部工具桥接逻辑，内置工具继续保持禁用。
 
 ---
 
