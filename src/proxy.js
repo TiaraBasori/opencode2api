@@ -8,7 +8,6 @@ import https from 'https';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { fileURLToPath } from 'url';
 import { buildExternalToolRegistry, findExternalToolByName } from './tool-runtime/registry.js';
 import { buildToolExposure } from './tool-runtime/router.js';
 import { evaluateToolPolicy } from './tool-runtime/policy.js';
@@ -19,8 +18,6 @@ import {
     createToolCallFilter,
     createExternalToolCallStreamParser
 } from './tool-runtime/parser.js';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function getImageDataUri(url) {
     if (url.startsWith('data:')) {
@@ -334,8 +331,7 @@ export function createApp(config) {
         REQUEST_TIMEOUT_MS,
         DEBUG,
         DISABLE_TOOLS,
-        EXTERNAL_TOOLS_MODE,
-        EXTERNAL_TOOLS_CONFLICT_POLICY,
+        INTERNAL_WEB_FETCH_ENABLED,
         PROMPT_MODE,
         OMIT_SYSTEM_PROMPT,
         AUTO_CLEANUP_CONVERSATIONS,
@@ -440,7 +436,7 @@ export function createApp(config) {
     };
 
     // Models endpoint
-    app.get('/v1/models', async (req, res) => {
+    app.get('/v1/models', async (_req, res) => {
         try {
             const models = buildModelsList(await getProvidersList());
             res.json({ object: 'list', data: models });
@@ -456,10 +452,17 @@ export function createApp(config) {
         }
     };
 
+    const TOOL_MODE = Object.freeze({
+        DISABLED: 'disabled',
+        EXTERNAL_BRIDGE: 'external-bridge',
+        INTERNAL_WEB_FETCH: 'internal-web-fetch'
+    });
+
     const TOOL_GUARD_MESSAGE = 'Tools are disabled. Do not call tools or function calls. Answer directly from the conversation and general knowledge. If external or real-time data is required, say so and ask the user to enable tools.';
     const EXTERNAL_TOOL_GUARD_MESSAGE = 'OpenCode internal tools remain disabled. If an external tool contract is present, use only that contract and never call or mention OpenCode internal tools.';
+    const INTERNAL_WEB_FETCH_SYSTEM_PROMPT = 'OpenCode internal tool access is limited for this turn. You may use only the built-in web_fetch tool when external or real-time web content is required. Do not mention or attempt any other internal tools. If web_fetch is unavailable or unsuitable, answer directly and say live web fetch is unavailable.';
 
-    const buildSystemPrompt = (systemMsg, reasoningEffort = null, hasExternalTools = false) => {
+    const buildSystemPrompt = (systemMsg, reasoningEffort = null, toolMode = TOOL_MODE.DISABLED) => {
         const parts = [];
         if (!OMIT_SYSTEM_PROMPT && systemMsg && systemMsg.trim()) {
             parts.push(systemMsg.trim());
@@ -467,8 +470,10 @@ export function createApp(config) {
         if (reasoningEffort && reasoningEffort !== 'none') {
             parts.push(`[Reasoning Effort: ${reasoningEffort}]`);
         }
-        if (DISABLE_TOOLS && PROMPT_MODE !== 'plugin-inject') {
-            parts.push(hasExternalTools ? EXTERNAL_TOOL_GUARD_MESSAGE : TOOL_GUARD_MESSAGE);
+        if (toolMode === TOOL_MODE.INTERNAL_WEB_FETCH) {
+            parts.push(INTERNAL_WEB_FETCH_SYSTEM_PROMPT);
+        } else if (DISABLE_TOOLS && PROMPT_MODE !== 'plugin-inject') {
+            parts.push(toolMode === TOOL_MODE.EXTERNAL_BRIDGE ? EXTERNAL_TOOL_GUARD_MESSAGE : TOOL_GUARD_MESSAGE);
         }
         const finalPrompt = parts.join('\n\n').trim();
         return finalPrompt || undefined;
@@ -533,6 +538,7 @@ export function createApp(config) {
         return String(content);
     };
 
+
     const createExternalToolContext = (tools, toolChoice) => {
         const registry = buildExternalToolRegistry(tools);
         const exposure = buildToolExposure(registry, toolChoice);
@@ -544,9 +550,34 @@ export function createApp(config) {
         };
     };
 
-    const getPolicyDecision = (toolCall) => {
-        const toolDescriptor = toolCall?.tool || findExternalToolByName([], toolCall?.function?.name);
-        return evaluateToolPolicy(toolDescriptor, toolCall?.validatedArguments || {}, { config });
+    const resolveToolMode = (tools = []) => {
+        if (Array.isArray(tools) && tools.length > 0) {
+            return TOOL_MODE.EXTERNAL_BRIDGE;
+        }
+        if (INTERNAL_WEB_FETCH_ENABLED) {
+            return TOOL_MODE.INTERNAL_WEB_FETCH;
+        }
+        return TOOL_MODE.DISABLED;
+    };
+
+    const createRequestToolContext = (tools, toolChoice) => {
+        const mode = resolveToolMode(tools);
+        const external = mode === TOOL_MODE.EXTERNAL_BRIDGE
+            ? createExternalToolContext(tools, toolChoice)
+            : {
+                registry: [],
+                exposure: { tools: [], toolChoice: { mode: 'auto', requiredTool: null }, prompt: '' },
+                toolChoice: { mode: 'auto', requiredTool: null },
+                prompt: ''
+            };
+
+        return {
+            mode,
+            external,
+            internal: {
+                allowWebFetch: mode === TOOL_MODE.INTERNAL_WEB_FETCH
+            }
+        };
     };
 
     const finalizeValidatedToolCalls = (parsedToolCalls, registry) => {
@@ -617,13 +648,14 @@ export function createApp(config) {
     };
 
     const TOOL_IDS_CACHE_MS = 5 * 60 * 1000;
-    let cachedToolOverrides = null;
-    let cachedToolAt = 0;
+    let cachedToolIds = null;
+    let cachedToolIdsAt = 0;
+    let cachedDisabledToolOverrides = null;
+    let cachedDisabledToolOverridesAt = 0;
 
-    const getToolOverrides = async () => {
-        if (!DISABLE_TOOLS) return null;
-        if (cachedToolOverrides && Date.now() - cachedToolAt < TOOL_IDS_CACHE_MS) {
-            return cachedToolOverrides;
+    const getBackendToolIds = async () => {
+        if (cachedToolIds && Date.now() - cachedToolIdsAt < TOOL_IDS_CACHE_MS) {
+            return cachedToolIds;
         }
         try {
             const idsRes = await client.tool.ids();
@@ -632,18 +664,58 @@ export function createApp(config) {
                 : Array.isArray(idsRes)
                     ? idsRes
                     : [];
-            const overrides = {};
-            ids.forEach((id) => {
-                overrides[id] = false;
-            });
-            cachedToolOverrides = overrides;
-            cachedToolAt = Date.now();
-            logDebug('Tool overrides loaded', { count: ids.length });
-            return overrides;
+            cachedToolIds = ids;
+            cachedToolIdsAt = Date.now();
+            return ids;
         } catch (e) {
-            logDebug('Tool override fetch failed', { error: e.message });
+            logDebug('Tool id fetch failed', { error: e.message });
             return null;
         }
+    };
+
+    const buildDisabledToolOverrides = (ids = []) => {
+        const overrides = {};
+        ids.forEach((id) => {
+            overrides[id] = false;
+        });
+        return overrides;
+    };
+
+    const getDisabledToolOverrides = async () => {
+        if (!DISABLE_TOOLS) return null;
+        if (cachedDisabledToolOverrides && Date.now() - cachedDisabledToolOverridesAt < TOOL_IDS_CACHE_MS) {
+            return cachedDisabledToolOverrides;
+        }
+        const ids = await getBackendToolIds();
+        if (!Array.isArray(ids)) return null;
+        const overrides = buildDisabledToolOverrides(ids);
+        cachedDisabledToolOverrides = overrides;
+        cachedDisabledToolOverridesAt = Date.now();
+        logDebug('Disabled tool overrides loaded', { count: ids.length });
+        return overrides;
+    };
+
+    const getToolOverridesForMode = async (toolMode) => {
+        if (toolMode === TOOL_MODE.EXTERNAL_BRIDGE || toolMode === TOOL_MODE.DISABLED) {
+            return getDisabledToolOverrides();
+        }
+        if (toolMode !== TOOL_MODE.INTERNAL_WEB_FETCH) {
+            return null;
+        }
+        const ids = await getBackendToolIds();
+        if (!Array.isArray(ids) || ids.length === 0) return null;
+        const normalizedIds = ids.filter((id) => typeof id === 'string' && id.trim());
+        const webFetchId = normalizedIds.find((id) => id === 'web_fetch' || id.endsWith('.web_fetch') || id.endsWith('/web_fetch'));
+        if (!webFetchId) {
+            logDebug('Internal web_fetch unavailable in backend tool ids');
+            return buildDisabledToolOverrides(normalizedIds);
+        }
+        const overrides = {};
+        normalizedIds.forEach((id) => {
+            overrides[id] = id === webFetchId;
+        });
+        logDebug('Internal web_fetch tool overrides loaded', { count: normalizedIds.length, webFetchId });
+        return overrides;
     };
 
     async function promptWithTimeout(promptParams, timeoutMs) {
@@ -713,13 +785,6 @@ export function createApp(config) {
             cleanupConversationFiles().catch((e) => logDebug('Cleanup run failed', { error: e.message }));
         }, CLEANUP_INTERVAL_MS);
         if (cleanupTimer.unref) cleanupTimer.unref();
-    }
-
-    class NoEventDataError extends Error {
-        constructor(message) {
-            super(message);
-            this.name = 'NoEventDataError';
-        }
     }
 
     function extractFromParts(parts) {
@@ -1030,14 +1095,16 @@ export function createApp(config) {
                         };
                     };
 
-                    const externalToolContext = createExternalToolContext(tools, tool_choice);
+                    const requestToolContext = createRequestToolContext(tools, tool_choice);
+                    const toolMode = requestToolContext.mode;
+                    const externalToolContext = requestToolContext.external;
                     const externalToolRegistry = externalToolContext.registry;
                     const externalToolChoice = externalToolContext.toolChoice;
                     const { parts, system: systemMsg, fullPromptText, lastUserMsg } = await buildPromptParts(messages, externalToolRegistry);
                     const systemWithGuard = buildSystemPrompt(
                         [systemMsg, externalToolContext.prompt].filter(Boolean).join('\n\n'),
                         requestParams.reasoning_effort,
-                        externalToolRegistry.length > 0
+                        toolMode
                     );
                     if (!parts.length) {
                         return res.status(400).json({ error: { message: 'messages must include at least one non-system text message' } });
@@ -1049,7 +1116,8 @@ export function createApp(config) {
                         system: Boolean(systemMsg),
                         lastUserLength: lastUserMsg?.length || 0,
                         parts: parts.length,
-                        disableTools: DISABLE_TOOLS
+                        disableTools: DISABLE_TOOLS,
+                        toolMode
                     });
 
                     // Ensure backend is running
@@ -1090,7 +1158,7 @@ export function createApp(config) {
                             ...(requestParams.stop && { stop: requestParams.stop })
                         }
                     };
-                    const toolOverrides = await getToolOverrides();
+                    const toolOverrides = await getToolOverridesForMode(toolMode);
                     if (toolOverrides && Object.keys(toolOverrides).length > 0) {
                         promptParams.body.tools = toolOverrides;
                     }
@@ -1226,7 +1294,6 @@ export function createApp(config) {
                                 DEFAULT_EVENT_IDLE_TIMEOUT_MS
                             );
                             const safeCollect = collectPromise.catch((err) => ({ __error: err }));
-                            const promptStart = Date.now();
                             client.session.prompt(promptParams).catch(err => logDebug('Prompt error:', err.message));
                             collected = await safeCollect;
                         } catch (e) {
@@ -1493,7 +1560,7 @@ export function createApp(config) {
     });
 
     // Health check
-    app.get('/health', (req, res) => res.json({
+    app.get('/health', (_req, res) => res.json({
         status: 'ok',
         proxy: true
     }));
@@ -1506,7 +1573,6 @@ export function createApp(config) {
                 reasoning_effort,
                 reasoning: requestReasoning,
                 max_output_tokens,
-                store = true,
                 tools = [],
                 tool_choice,
                 instructions,
@@ -1522,14 +1588,16 @@ export function createApp(config) {
                 null
             );
 
+            const requestToolContext = createRequestToolContext(tools, tool_choice);
+            const toolMode = requestToolContext.mode;
             logDebug('Responses API request', { 
                 model, 
                 reasoning_effort: reasoning_effort || requestReasoning?.effort,
                 reasoningLevel,
-                max_output_tokens 
+                max_output_tokens,
+                toolMode
             });
-
-            const externalToolContext = createExternalToolContext(tools, tool_choice);
+            const externalToolContext = requestToolContext.external;
             const externalToolRegistry = externalToolContext.registry;
             const externalToolChoice = externalToolContext.toolChoice;
             const assistantToolCalls = new Map();
@@ -1679,7 +1747,7 @@ export function createApp(config) {
             const systemWithGuard = buildSystemPrompt(
                 [instructions, ...systemChunks, externalToolContext.prompt].filter(Boolean).join('\n\n'),
                 reasoningLevel,
-                externalToolRegistry.length > 0
+                toolMode
             );
 
             const requestForcedResponsesToolCall = createForcedToolCallRequester({
@@ -1689,7 +1757,7 @@ export function createApp(config) {
                 requiredTool: externalToolChoice.requiredTool || externalToolRegistry[0]?.namespacedName,
                 providerID: pID,
                 modelID: mID,
-                toolOverrides: await getToolOverrides(),
+                toolOverrides: await getToolOverridesForMode(toolMode),
                 requestTimeoutMs: REQUEST_TIMEOUT_MS,
                 forbidThinkBlock: false
             });
@@ -1705,7 +1773,7 @@ export function createApp(config) {
                     ...(top_p !== undefined && { top_p })
                 }
             };
-            const toolOverrides = await getToolOverrides();
+            const toolOverrides = await getToolOverridesForMode(toolMode);
             if (toolOverrides && Object.keys(toolOverrides).length > 0) {
                 promptParams.body.tools = toolOverrides;
             }
