@@ -20,6 +20,9 @@ const sdkMocks = {
         }
     })),
     configUpdate: jest.fn(async () => ({})),
+    toolIds: jest.fn(async () => ({
+        data: ['web_fetch', 'filesystem', 'bash']
+    })),
     sessionCreate: jest.fn(async () => ({
         data: { id: 'test-session-id' }
     })),
@@ -107,6 +110,9 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
             providers: sdkMocks.configProviders,
             update: sdkMocks.configUpdate
         },
+        tool: {
+            ids: sdkMocks.toolIds
+        },
         session: {
             create: sdkMocks.sessionCreate,
             prompt: sdkMocks.sessionPrompt,
@@ -131,6 +137,7 @@ describe('Proxy OpenAI API', () => {
 
     beforeEach(() => {
         jest.clearAllMocks();
+        sdkMocks.toolIds.mockResolvedValue({ data: ['web_fetch', 'filesystem', 'bash'] });
         const config = {
             PORT: 10000,
             API_KEY: 'test-key',
@@ -284,6 +291,85 @@ describe('Proxy OpenAI API', () => {
         expect(promptCall.body.system).toContain('Use only the namespaced names listed below. Do not use original client tool names inside function calls.');
         expect(promptCall.body.system).toContain('external__web_fetch');
         expect(promptCall.body.tools).toBeUndefined();
+        expect(sdkMocks.toolIds).not.toHaveBeenCalled();
+    });
+
+    test('POST /v1/chat/completions enables only internal web_fetch when client tools are omitted and feature flag is on', async () => {
+        const internalApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            INTERNAL_WEB_FETCH_ENABLED: true
+        }).app;
+
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'Fetched content summary' }]
+            }
+        ]);
+
+        const res = await request(internalApp)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Fetch https://example.com' }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.choices[0].finish_reason).toEqual('stop');
+        expect(res.body.choices[0].message).toEqual({
+            role: 'assistant',
+            content: 'Fetched content summary'
+        });
+
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).toContain('You may use only the built-in web_fetch tool');
+        expect(promptCall.body.system).not.toContain('External tools are virtualized by this proxy. They are not OpenCode tools.');
+        expect(promptCall.body.tools).toEqual({
+            web_fetch: true,
+            filesystem: false,
+            bash: false
+        });
+        expect(sdkMocks.toolIds).toHaveBeenCalledTimes(1);
+    });
+
+    test('POST /v1/chat/completions falls back to fully disabled native tools when internal web_fetch is unavailable', async () => {
+        const internalApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            INTERNAL_WEB_FETCH_ENABLED: true
+        }).app;
+        sdkMocks.toolIds.mockResolvedValueOnce({ data: ['filesystem', 'bash'] });
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'Live web fetch is unavailable.' }]
+            }
+        ]);
+
+        const res = await request(internalApp)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Fetch https://example.com' }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.tools).toEqual({
+            filesystem: false,
+            bash: false
+        });
     });
 
     test('POST /v1/chat/completions continues after tool result messages with matching tool_call_id', async () => {
@@ -738,6 +824,58 @@ describe('Proxy OpenAI API', () => {
         expect(promptCall.body.system).toContain('Use only the namespaced names listed below. Do not use original client tool names inside function calls.');
         expect(promptCall.body.system).toContain('external__web_fetch');
         expect(promptCall.body.tools).toBeUndefined();
+        expect(sdkMocks.toolIds).not.toHaveBeenCalled();
+    });
+
+    test('POST /v1/responses enables only internal web_fetch when client tools are omitted and feature flag is on', async () => {
+        const internalApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            INTERNAL_WEB_FETCH_ENABLED: true
+        }).app;
+
+        sdkMocks.sessionPrompt.mockResolvedValueOnce({
+            data: {
+                parts: [{ type: 'text', text: 'Fetched via internal web_fetch' }]
+            }
+        });
+
+        const res = await request(internalApp)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'Fetch https://example.com'
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.output).toEqual([
+            {
+                type: 'message',
+                role: 'assistant',
+                status: 'completed',
+                content: [
+                    {
+                        type: 'output_text',
+                        text: 'Fetched via internal web_fetch'
+                    }
+                ]
+            }
+        ]);
+
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).toContain('You may use only the built-in web_fetch tool');
+        expect(promptCall.body.system).not.toContain('External tools are virtualized by this proxy. They are not OpenCode tools.');
+        expect(promptCall.body.tools).toEqual({
+            web_fetch: true,
+            filesystem: false,
+            bash: false
+        });
+        expect(sdkMocks.toolIds).toHaveBeenCalledTimes(1);
     });
 
     test('POST /v1/responses continues after function_call_output input and returns assistant text', async () => {
