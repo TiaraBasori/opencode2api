@@ -1,7 +1,7 @@
 # ⚙️ 配置详解
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.5.0-blue" alt="Version">
 </p>
 
 ---
