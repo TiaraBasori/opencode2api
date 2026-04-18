@@ -554,15 +554,50 @@ export function createApp(config) {
         return registry.find((tool) => tool.namespacedName === name || tool.originalName === name) || null;
     };
 
-    const buildExternalToolsPrompt = (registry) => {
+    const normalizeExternalToolChoice = (toolChoice, registry) => {
+        if (!toolChoice || !Array.isArray(registry) || registry.length === 0) {
+            return { mode: 'auto', requiredTool: null };
+        }
+        if (toolChoice === 'auto' || toolChoice === 'none') {
+            return { mode: toolChoice, requiredTool: null };
+        }
+        if (toolChoice === 'required') {
+            return { mode: 'required', requiredTool: null };
+        }
+        const requestedName = toolChoice?.function?.name;
+        if (toolChoice?.type === 'function' && requestedName) {
+            const mappedTool = findExternalToolByName(registry, requestedName);
+            return {
+                mode: 'required',
+                requiredTool: mappedTool?.namespacedName || `${EXTERNAL_TOOL_PREFIX}${requestedName}`
+            };
+        }
+        return { mode: 'auto', requiredTool: null };
+    };
+
+    const buildExternalToolsPrompt = (registry, toolChoice = null) => {
         if (!Array.isArray(registry) || registry.length === 0) return '';
+        const normalizedChoice = normalizeExternalToolChoice(toolChoice, registry);
+        const choiceInstructions = [];
+        if (normalizedChoice.mode === 'required') {
+            if (normalizedChoice.requiredTool) {
+                choiceInstructions.push(`Tool use is REQUIRED for this turn. You MUST call ${normalizedChoice.requiredTool} before giving any final answer.`);
+            } else {
+                choiceInstructions.push('Tool use is REQUIRED for this turn. You MUST call an external tool before giving any final answer.');
+            }
+        } else if (normalizedChoice.mode === 'none') {
+            choiceInstructions.push('Tool use is disabled for this turn. Do not emit <function_calls>.');
+        }
         return [
             'External tools are virtualized by this proxy. They are not OpenCode tools.',
-            'When you need an external tool, respond with ONLY one or more <function_calls>...</function_calls> blocks.',
+            'When you need an external tool, your entire assistant reply MUST be ONLY one or more <function_calls>...</function_calls> blocks.',
+            'Do NOT output <think>, explanations, markdown, prose, or any text before or after <function_calls> blocks when making a tool call.',
             'Each block must contain JSON with this exact shape:',
             '{"name":"external__tool_name","arguments":{}}',
+            'Arguments must be a valid JSON object that matches the declared schema.',
             'Use only the namespaced names listed below. Do not use original client tool names inside function calls.',
             'If tool results are later provided as TOOL_RESULT messages, use those results to continue normally.',
+            ...choiceInstructions,
             `Available external tools: ${JSON.stringify(registry.map((tool) => ({
                 name: tool.namespacedName,
                 client_name: tool.originalName,
@@ -976,7 +1011,7 @@ export function createApp(config) {
                 let keepaliveInterval = null;
 
                 try {
-                    const { messages, model, tools = [], stream: requestStream, temperature, max_tokens, top_p, frequency_penalty, presence_penalty, stop, reasoning_effort, reasoning } = req.body;
+                    const { messages, model, tools = [], tool_choice, stream: requestStream, temperature, max_tokens, top_p, frequency_penalty, presence_penalty, stop, reasoning_effort, reasoning } = req.body;
                     stream = Boolean(requestStream);
                     if (!messages || !Array.isArray(messages) || messages.length === 0) {
                         return res.status(400).json({ error: { message: 'messages array is required' } });
@@ -1113,7 +1148,7 @@ export function createApp(config) {
 
                     const externalToolRegistry = buildExternalToolRegistry(tools);
                     const { parts, system: systemMsg, fullPromptText, lastUserMsg } = await buildPromptParts(messages, externalToolRegistry);
-                    const toolsPrompt = buildExternalToolsPrompt(externalToolRegistry);
+                    const toolsPrompt = buildExternalToolsPrompt(externalToolRegistry, tool_choice);
                     const systemWithGuard = buildSystemPrompt(
                         [systemMsg, toolsPrompt].filter(Boolean).join('\n\n'),
                         requestParams.reasoning_effort,
@@ -1554,6 +1589,7 @@ export function createApp(config) {
                 max_output_tokens,
                 store = true,
                 tools = [],
+                tool_choice,
                 instructions,
                 temperature,
                 top_p,
@@ -1564,7 +1600,7 @@ export function createApp(config) {
 
             const reasoningLevel = normalizeReasoningEffort(
                 reasoning_effort || requestReasoning?.effort,
-                'medium'
+                null
             );
 
             logDebug('Responses API request', { 
@@ -1575,6 +1611,7 @@ export function createApp(config) {
             });
 
             const externalToolRegistry = buildExternalToolRegistry(tools);
+            const externalToolChoice = normalizeExternalToolChoice(tool_choice, externalToolRegistry);
             const assistantToolCalls = new Map();
 
             const rememberAssistantToolCall = (toolCallId, toolName) => {
@@ -1703,22 +1740,49 @@ export function createApp(config) {
             const parts = [];
             const systemChunks = [];
             let fullPromptText = '';
+            const formatResponsesRoleLine = (role, text) => `${String(role || 'user').toUpperCase()}: ${text}`;
             for (const msg of messages) {
                 if (msg.role === 'system') {
                     if (msg.content) systemChunks.push(msg.content);
                     continue;
                 }
                 if (!msg.content) continue;
-                parts.push({ type: 'text', text: msg.content });
-                fullPromptText += `${msg.role}: ${msg.content}\n\n`;
+                const text = msg.role === 'tool' || String(msg.content).startsWith('ASSISTANT: ') || String(msg.content).startsWith('TOOL_RESULT: ')
+                    ? msg.content
+                    : formatResponsesRoleLine(msg.role, msg.content);
+                parts.push({ type: 'text', text });
+                fullPromptText += `${text}\n\n`;
             }
 
-            const toolsPrompt = buildExternalToolsPrompt(externalToolRegistry);
+            const toolsPrompt = buildExternalToolsPrompt(externalToolRegistry, tool_choice);
             const systemWithGuard = buildSystemPrompt(
                 [instructions, ...systemChunks, toolsPrompt].filter(Boolean).join('\n\n'),
                 reasoningLevel,
                 externalToolRegistry.length > 0
             );
+
+            const requestForcedResponsesToolCall = async () => {
+                if (externalToolChoice.mode !== 'required') return null;
+                const requiredName = externalToolChoice.requiredTool || externalToolRegistry[0]?.namespacedName;
+                if (!requiredName) return null;
+                const forcedPromptParams = {
+                    path: { id: sessionId },
+                    body: {
+                        model: { providerID: pID, modelID: mID },
+                        ...(systemWithGuard ? { system: systemWithGuard } : {}),
+                        parts: [{
+                            type: 'text',
+                            text: `SYSTEM: Your previous reply did not emit the required external tool call. Reply now with ONLY <function_calls>{\"name\":\"${requiredName}\",\"arguments\":{}}</function_calls> or an array inside <function_calls>...</function_calls>. Do not output any prose, reasoning, or markdown. Infer the correct arguments from the conversation so far.`
+                        }]
+                    }
+                };
+                const toolOverrides = await getToolOverrides();
+                if (toolOverrides && Object.keys(toolOverrides).length > 0) {
+                    forcedPromptParams.body.tools = toolOverrides;
+                }
+                await promptWithTimeout(forcedPromptParams, REQUEST_TIMEOUT_MS);
+                return pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+            };
 
             const promptParams = {
                 path: { id: sessionId },
@@ -1894,6 +1958,10 @@ export function createApp(config) {
                             delta: filtered
                         });
                     } else {
+                        if (!filtered.trim()) {
+                            content += filtered;
+                            return;
+                        }
                         ensureOutputScaffold();
                         content += filtered;
                         emit({
@@ -1965,7 +2033,9 @@ export function createApp(config) {
                     });
                 }
 
-                if (announcedContent) {
+                const hasMeaningfulContent = Boolean(content && content.trim());
+
+                if (announcedContent && hasMeaningfulContent) {
                     emit({
                         type: 'response.output_text.done',
                         sequence_number: nextSeq(),
@@ -1996,11 +2066,32 @@ export function createApp(config) {
                     });
                 }
 
-                const parsedToolCalls = streamedToolCalls.length > 0
+                let polledForToolCalls = null;
+                if (externalToolRegistry.length > 0 && streamedToolCalls.length === 0) {
+                    try {
+                        polledForToolCalls = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                    } catch (e) { }
+                }
+
+                let parsedToolCalls = streamedToolCalls.length > 0
                     ? streamedToolCalls
                     : (externalToolRegistry.length > 0
-                        ? parseExternalToolCallsFromText(externalToolRegistry, rawReasoning, rawContent)
+                        ? parseExternalToolCallsFromText(
+                            externalToolRegistry,
+                            polledForToolCalls?.reasoning || rawReasoning,
+                            polledForToolCalls?.content || rawContent
+                        )
                         : []);
+                if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                    const forcedResponse = await requestForcedResponsesToolCall();
+                    if (forcedResponse) {
+                        parsedToolCalls = parseExternalToolCallsFromText(
+                            externalToolRegistry,
+                            forcedResponse.reasoning,
+                            forcedResponse.content
+                        );
+                    }
+                }
                 const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
                 const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
                 if (streamedToolCalls.length === 0) {
@@ -2009,7 +2100,7 @@ export function createApp(config) {
                     });
                 }
                 const streamOutput = [];
-                const streamMessageOutputItem = buildResponsesMessageOutputItem(safeContent);
+                const streamMessageOutputItem = buildResponsesMessageOutputItem(safeContent && safeContent.trim() ? safeContent : '');
                 if (streamMessageOutputItem) streamOutput.push(streamMessageOutputItem);
                 parsedToolCalls.forEach((toolCall) => {
                     streamOutput.push(buildResponsesFunctionCallOutputItem(toolCall));
@@ -2042,18 +2133,35 @@ export function createApp(config) {
 
             const responseRes = await client.session.prompt(promptParams);
             const responseParts = responseRes.data?.parts || [];
-            
+
             content = responseParts.filter(p => p.type === 'text').map(p => p.text).join('\n');
             reasoning = responseParts.filter(p => p.type === 'reasoning').map(p => p.text).join('\n');
 
-            if (!content && responseRes.data) {
+            const polledResponse = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+            if (polledResponse.error && !polledResponse.content && !polledResponse.reasoning) {
+                throw polledResponse.error;
+            }
+            if (polledResponse.content || polledResponse.reasoning) {
+                content = polledResponse.content || content;
+                reasoning = polledResponse.reasoning || reasoning;
+            }
+
+            if (!content && !reasoning && responseRes.data) {
                 const data = responseRes.data;
                 content = typeof data === 'string' ? data : data?.message || JSON.stringify(data);
             }
 
-            const parsedToolCalls = externalToolRegistry.length > 0
+            let parsedToolCalls = externalToolRegistry.length > 0
                 ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
                 : [];
+            if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                const forcedResponse = await requestForcedResponsesToolCall();
+                if (forcedResponse) {
+                    content = forcedResponse.content || content;
+                    reasoning = forcedResponse.reasoning || reasoning;
+                    parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
+                }
+            }
             const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
             const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
 
