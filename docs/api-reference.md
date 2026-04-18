@@ -203,6 +203,49 @@ curl -X POST http://127.0.0.1:10000/v1/responses \
 
 非流式 `responses` 响应会在 `response.output` 中返回 `type: "function_call"` 项；流式模式会发送 function_call 生命周期和参数增量事件。
 
+### 🧭 推荐提示模板（OpenClaw / Claude Code）
+
+在真实运行环境中，如果你希望第一跳**稳定先产出 tool call**，推荐把“调用工具”和“基于工具结果继续回答”拆成两步，而不是混在同一句里。
+
+**推荐第一跳提示：**
+
+```text
+Call weather_lookup for Tokyo now. Do not answer directly.
+```
+
+或中文：
+
+```text
+现在调用 weather_lookup 查询 Tokyo。不要直接回答。
+```
+
+收到 `tool_calls` / `function_call` 后，再把工具结果回灌，并追加第二跳提示：
+
+```text
+Great, now answer the original request using the tool result.
+```
+
+或中文：
+
+```text
+很好，现在基于工具结果回答原始问题。
+```
+
+### 为什么推荐两段式提示
+
+- 第一跳只负责**稳定产出工具调用**
+- 第二跳只负责**基于工具结果生成最终回答**
+- 这样比把“先调工具再回答”写在同一条用户消息里更稳定，尤其适合 OpenClaw、Claude Code 这类 agent 客户端
+
+### 推荐的 agent 行为
+
+1. 先发送严格的 tool-only 提示
+2. 如果收到 `tool_calls` / `function_call`，执行工具
+3. 回灌工具结果
+4. 再发送第二跳提示要求模型整合工具结果回答
+
+> 这个两段式模式是当前 `opencode2api` 外部工具桥接的推荐集成方式。
+
 ### 🌊 流式工具调用
 
 ```bash
