@@ -332,6 +332,9 @@ export function createApp(config) {
         DEBUG,
         DISABLE_TOOLS,
         INTERNAL_WEB_FETCH_ENABLED,
+        INTERNAL_ALLOWED_TOOLS = [],
+        INTERNAL_TOOL_METRICS_ENABLED = true,
+        INTERNAL_TOOL_DISCOVERY_FIXTURE = [],
         PROMPT_MODE,
         OMIT_SYSTEM_PROMPT,
         AUTO_CLEANUP_CONVERSATIONS,
@@ -455,12 +458,29 @@ export function createApp(config) {
     const TOOL_MODE = Object.freeze({
         DISABLED: 'disabled',
         EXTERNAL_BRIDGE: 'external-bridge',
-        INTERNAL_WEB_FETCH: 'internal-web-fetch'
+        INTERNAL_ALLOWLIST: 'internal-allowlist'
     });
 
     const TOOL_GUARD_MESSAGE = 'Tools are disabled. Do not call tools or function calls. Answer directly from the conversation and general knowledge. If external or real-time data is required, say so and ask the user to enable tools.';
     const EXTERNAL_TOOL_GUARD_MESSAGE = 'OpenCode internal tools remain disabled. If an external tool contract is present, use only that contract and never call or mention OpenCode internal tools.';
-    const INTERNAL_WEB_FETCH_SYSTEM_PROMPT = 'OpenCode internal tool access is limited for this turn. You may use only the built-in web_fetch tool when external or real-time web content is required. Do not mention or attempt any other internal tools. If web_fetch is unavailable or unsuitable, answer directly and say live web fetch is unavailable.';
+
+    const normalizeConfiguredToolNames = (entries = []) => [...new Set(
+        entries
+            .map((entry) => String(entry || '').trim())
+            .filter(Boolean)
+    )];
+
+    const getEffectiveInternalAllowedTools = () => {
+        const configuredTools = normalizeConfiguredToolNames(INTERNAL_ALLOWED_TOOLS);
+        if (configuredTools.length > 0) return configuredTools;
+        if (INTERNAL_WEB_FETCH_ENABLED) return ['web_fetch'];
+        return [];
+    };
+
+    const INTERNAL_ALLOWED_TOOL_NAMES = getEffectiveInternalAllowedTools();
+    const INTERNAL_ALLOWLIST_PROMPT = INTERNAL_ALLOWED_TOOL_NAMES.length > 0
+        ? `OpenCode internal tool access is limited for this turn. You may use only these built-in tools when truly required: ${INTERNAL_ALLOWED_TOOL_NAMES.join(', ')}. Do not mention or attempt any other internal tools. If the required internal tools are unavailable, answer directly and say live tool access is unavailable.`
+        : 'OpenCode internal tools are unavailable for this turn. Answer directly without attempting tool usage.';
 
     const buildSystemPrompt = (systemMsg, reasoningEffort = null, toolMode = TOOL_MODE.DISABLED) => {
         const parts = [];
@@ -470,8 +490,8 @@ export function createApp(config) {
         if (reasoningEffort && reasoningEffort !== 'none') {
             parts.push(`[Reasoning Effort: ${reasoningEffort}]`);
         }
-        if (toolMode === TOOL_MODE.INTERNAL_WEB_FETCH) {
-            parts.push(INTERNAL_WEB_FETCH_SYSTEM_PROMPT);
+        if (toolMode === TOOL_MODE.INTERNAL_ALLOWLIST) {
+            parts.push(INTERNAL_ALLOWLIST_PROMPT);
         } else if (DISABLE_TOOLS && PROMPT_MODE !== 'plugin-inject') {
             parts.push(toolMode === TOOL_MODE.EXTERNAL_BRIDGE ? EXTERNAL_TOOL_GUARD_MESSAGE : TOOL_GUARD_MESSAGE);
         }
@@ -554,8 +574,8 @@ export function createApp(config) {
         if (Array.isArray(tools) && tools.length > 0) {
             return TOOL_MODE.EXTERNAL_BRIDGE;
         }
-        if (INTERNAL_WEB_FETCH_ENABLED) {
-            return TOOL_MODE.INTERNAL_WEB_FETCH;
+        if (INTERNAL_ALLOWED_TOOL_NAMES.length > 0) {
+            return TOOL_MODE.INTERNAL_ALLOWLIST;
         }
         return TOOL_MODE.DISABLED;
     };
@@ -575,7 +595,8 @@ export function createApp(config) {
             mode,
             external,
             internal: {
-                allowWebFetch: mode === TOOL_MODE.INTERNAL_WEB_FETCH
+                allowedToolNames: INTERNAL_ALLOWED_TOOL_NAMES,
+                metricsEnabled: INTERNAL_TOOL_METRICS_ENABLED
             }
         };
     };
@@ -652,10 +673,50 @@ export function createApp(config) {
     let cachedToolIdsAt = 0;
     let cachedDisabledToolOverrides = null;
     let cachedDisabledToolOverridesAt = 0;
+    const internalToolMetrics = {
+        externalBridgeRequests: 0,
+        internalAllowlistRequests: 0,
+        disabledRequests: 0,
+        discoveryFailures: 0,
+        fallbackToDisabled: 0
+    };
+
+    const logInternalToolEvent = (event, details = {}) => {
+        if (!DEBUG && !INTERNAL_TOOL_METRICS_ENABLED) return;
+        const payload = {
+            event,
+            ...details
+        };
+        if (INTERNAL_TOOL_METRICS_ENABLED) {
+            payload.metrics = { ...internalToolMetrics };
+        }
+        logDebug('Internal tool event', payload);
+    };
+
+    const trackToolMode = (toolMode, details = {}) => {
+        if (toolMode === TOOL_MODE.EXTERNAL_BRIDGE) {
+            internalToolMetrics.externalBridgeRequests += 1;
+        } else if (toolMode === TOOL_MODE.INTERNAL_ALLOWLIST) {
+            internalToolMetrics.internalAllowlistRequests += 1;
+        } else {
+            internalToolMetrics.disabledRequests += 1;
+        }
+        logInternalToolEvent('tool-mode-selected', {
+            toolMode,
+            ...details
+        });
+    };
 
     const getBackendToolIds = async () => {
         if (cachedToolIds && Date.now() - cachedToolIdsAt < TOOL_IDS_CACHE_MS) {
             return cachedToolIds;
+        }
+        const fixtureIds = normalizeConfiguredToolNames(INTERNAL_TOOL_DISCOVERY_FIXTURE);
+        if (fixtureIds.length > 0) {
+            cachedToolIds = fixtureIds;
+            cachedToolIdsAt = Date.now();
+            logInternalToolEvent('backend-tool-ids-fixture-loaded', { count: fixtureIds.length, fixtureIds });
+            return fixtureIds;
         }
         try {
             const idsRes = await client.tool.ids();
@@ -666,9 +727,11 @@ export function createApp(config) {
                     : [];
             cachedToolIds = ids;
             cachedToolIdsAt = Date.now();
+            logInternalToolEvent('backend-tool-ids-loaded', { count: ids.length });
             return ids;
         } catch (e) {
-            logDebug('Tool id fetch failed', { error: e.message });
+            internalToolMetrics.discoveryFailures += 1;
+            logInternalToolEvent('backend-tool-ids-failed', { error: e.message });
             return null;
         }
     };
@@ -681,6 +744,36 @@ export function createApp(config) {
         return overrides;
     };
 
+    const normalizeBackendToolIds = (ids = []) => ids.filter((id) => typeof id === 'string' && id.trim());
+
+    const matchesAllowedToolName = (toolId, allowedToolName) => {
+        if (!toolId || !allowedToolName) return false;
+        return toolId === allowedToolName || toolId.endsWith(`.${allowedToolName}`) || toolId.endsWith(`/${allowedToolName}`);
+    };
+
+    const resolveInternalAllowedToolIds = (ids = [], allowedToolNames = []) => {
+        const normalizedIds = normalizeBackendToolIds(ids);
+        const normalizedAllowedNames = normalizeConfiguredToolNames(allowedToolNames);
+        const matchedToolIds = new Set();
+        const unmatchedAllowedNames = [];
+
+        normalizedAllowedNames.forEach((allowedToolName) => {
+            const matches = normalizedIds.filter((toolId) => matchesAllowedToolName(toolId, allowedToolName));
+            if (matches.length === 0) {
+                unmatchedAllowedNames.push(allowedToolName);
+                return;
+            }
+            matches.forEach((match) => matchedToolIds.add(match));
+        });
+
+        return {
+            normalizedIds,
+            normalizedAllowedNames,
+            matchedToolIds: [...matchedToolIds],
+            unmatchedAllowedNames
+        };
+    };
+
     const getDisabledToolOverrides = async () => {
         if (!DISABLE_TOOLS) return null;
         if (cachedDisabledToolOverrides && Date.now() - cachedDisabledToolOverridesAt < TOOL_IDS_CACHE_MS) {
@@ -691,30 +784,46 @@ export function createApp(config) {
         const overrides = buildDisabledToolOverrides(ids);
         cachedDisabledToolOverrides = overrides;
         cachedDisabledToolOverridesAt = Date.now();
-        logDebug('Disabled tool overrides loaded', { count: ids.length });
+        logInternalToolEvent('disabled-tool-overrides-loaded', { count: ids.length });
         return overrides;
     };
 
-    const getToolOverridesForMode = async (toolMode) => {
+    const getToolOverridesForMode = async (toolMode, internalContext = {}) => {
         if (toolMode === TOOL_MODE.EXTERNAL_BRIDGE || toolMode === TOOL_MODE.DISABLED) {
+            if (toolMode === TOOL_MODE.DISABLED) {
+                logInternalToolEvent('internal-tools-disabled', {
+                    configuredAllowlist: internalContext.allowedToolNames || INTERNAL_ALLOWED_TOOL_NAMES
+                });
+            }
             return getDisabledToolOverrides();
         }
-        if (toolMode !== TOOL_MODE.INTERNAL_WEB_FETCH) {
+        if (toolMode !== TOOL_MODE.INTERNAL_ALLOWLIST) {
             return null;
         }
         const ids = await getBackendToolIds();
         if (!Array.isArray(ids) || ids.length === 0) return null;
-        const normalizedIds = ids.filter((id) => typeof id === 'string' && id.trim());
-        const webFetchId = normalizedIds.find((id) => id === 'web_fetch' || id.endsWith('.web_fetch') || id.endsWith('/web_fetch'));
-        if (!webFetchId) {
-            logDebug('Internal web_fetch unavailable in backend tool ids');
+        const resolution = resolveInternalAllowedToolIds(ids, internalContext.allowedToolNames || INTERNAL_ALLOWED_TOOL_NAMES);
+        const { normalizedIds, normalizedAllowedNames, matchedToolIds, unmatchedAllowedNames } = resolution;
+        if (matchedToolIds.length === 0) {
+            internalToolMetrics.fallbackToDisabled += 1;
+            logInternalToolEvent('internal-allowlist-unavailable', {
+                configuredAllowlist: normalizedAllowedNames,
+                availableToolIds: normalizedIds,
+                unmatchedAllowlist: unmatchedAllowedNames,
+                fallback: 'disabled'
+            });
             return buildDisabledToolOverrides(normalizedIds);
         }
         const overrides = {};
         normalizedIds.forEach((id) => {
-            overrides[id] = id === webFetchId;
+            overrides[id] = matchedToolIds.includes(id);
         });
-        logDebug('Internal web_fetch tool overrides loaded', { count: normalizedIds.length, webFetchId });
+        logInternalToolEvent('internal-allowlist-overrides-loaded', {
+            configuredAllowlist: normalizedAllowedNames,
+            matchedToolIds,
+            unmatchedAllowlist: unmatchedAllowedNames,
+            availableToolIdsCount: normalizedIds.length
+        });
         return overrides;
     };
 
@@ -1100,6 +1209,11 @@ export function createApp(config) {
                     const externalToolContext = requestToolContext.external;
                     const externalToolRegistry = externalToolContext.registry;
                     const externalToolChoice = externalToolContext.toolChoice;
+                    const internalToolContext = requestToolContext.internal;
+                    trackToolMode(toolMode, {
+                        configuredAllowlist: internalToolContext.allowedToolNames,
+                        route: '/v1/chat/completions'
+                    });
                     const { parts, system: systemMsg, fullPromptText, lastUserMsg } = await buildPromptParts(messages, externalToolRegistry);
                     const systemWithGuard = buildSystemPrompt(
                         [systemMsg, externalToolContext.prompt].filter(Boolean).join('\n\n'),
@@ -1117,7 +1231,8 @@ export function createApp(config) {
                         lastUserLength: lastUserMsg?.length || 0,
                         parts: parts.length,
                         disableTools: DISABLE_TOOLS,
-                        toolMode
+                        toolMode,
+                        internalAllowedTools: internalToolContext.allowedToolNames
                     });
 
                     // Ensure backend is running
@@ -1158,7 +1273,7 @@ export function createApp(config) {
                             ...(requestParams.stop && { stop: requestParams.stop })
                         }
                     };
-                    const toolOverrides = await getToolOverridesForMode(toolMode);
+                    const toolOverrides = await getToolOverridesForMode(toolMode, internalToolContext);
                     if (toolOverrides && Object.keys(toolOverrides).length > 0) {
                         promptParams.body.tools = toolOverrides;
                     }
@@ -1590,12 +1705,18 @@ export function createApp(config) {
 
             const requestToolContext = createRequestToolContext(tools, tool_choice);
             const toolMode = requestToolContext.mode;
+            const internalToolContext = requestToolContext.internal;
+            trackToolMode(toolMode, {
+                configuredAllowlist: internalToolContext.allowedToolNames,
+                route: '/v1/responses'
+            });
             logDebug('Responses API request', { 
                 model, 
                 reasoning_effort: reasoning_effort || requestReasoning?.effort,
                 reasoningLevel,
                 max_output_tokens,
-                toolMode
+                toolMode,
+                internalAllowedTools: internalToolContext.allowedToolNames
             });
             const externalToolContext = requestToolContext.external;
             const externalToolRegistry = externalToolContext.registry;
@@ -1757,7 +1878,7 @@ export function createApp(config) {
                 requiredTool: externalToolChoice.requiredTool || externalToolRegistry[0]?.namespacedName,
                 providerID: pID,
                 modelID: mID,
-                toolOverrides: await getToolOverridesForMode(toolMode),
+                toolOverrides: await getToolOverridesForMode(toolMode, internalToolContext),
                 requestTimeoutMs: REQUEST_TIMEOUT_MS,
                 forbidThinkBlock: false
             });
@@ -1773,7 +1894,7 @@ export function createApp(config) {
                     ...(top_p !== undefined && { top_p })
                 }
             };
-            const toolOverrides = await getToolOverridesForMode(toolMode);
+            const toolOverrides = await getToolOverridesForMode(toolMode, internalToolContext);
             if (toolOverrides && Object.keys(toolOverrides).length > 0) {
                 promptParams.body.tools = toolOverrides;
             }
