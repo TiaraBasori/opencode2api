@@ -174,7 +174,10 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 | `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用 |
 | `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
 | `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具与 OpenCode 内置工具的冲突隔离策略；当前仅支持 `namespace` |
-| `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `false` | 当请求未传入 `tools` 时，仅放行 OpenCode 内置 `web_fetch` |
+| `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `false` | 兼容旧开关；当未显式配置 allowlist 时，启用后默认放行 `web_fetch` |
+| `OPENCODE_INTERNAL_ALLOWED_TOOLS` | `(none)` | 当请求未传入 `tools` 时，允许使用的 OpenCode 内置工具列表，逗号分隔 |
+| `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED` | `true` | 输出 internal allowlist 模式的调试/指标日志 |
+| `OPENCODE_TOOL_DISCOVERY_FIXTURE` | `(none)` | 集成测试/本地调试用的后端工具 ID 固定列表，逗号分隔 |
 | `USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录 |
 | `OPENCODE_PROXY_PROMPT_MODE` | `standard` | 提示词处理模式 |
 | `OPENCODE_PROXY_OMIT_SYSTEM_PROMPT` | `false` | 忽略传入的 system prompt |
@@ -198,7 +201,9 @@ OPENCODE_SERVER_PASSWORD=your-password
 DISABLE_TOOLS=true
 OPENCODE_EXTERNAL_TOOLS_MODE=proxy-bridge
 OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY=namespace
-OPENCODE_INTERNAL_WEB_FETCH_ENABLED=false
+OPENCODE_INTERNAL_ALLOWED_TOOLS=web_fetch
+OPENCODE_INTERNAL_TOOL_METRICS_ENABLED=true
+OPENCODE_TOOL_DISCOVERY_FIXTURE=
 OPENCODE_PROXY_PROMPT_MODE=plugin-inject
 OPENCODE_PROXY_OMIT_SYSTEM_PROMPT=true
 OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
@@ -211,13 +216,15 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 - 同名冲突默认通过内部命名空间隔离处理，例如客户端的 `web_fetch` 不会误触发 OpenCode 容器内工具。
 - 内部命名空间名（如 `external__web_fetch`）是代理内部实现细节，不属于公开 API。
 
-### 内置 `web_fetch` 透传说明
+### 内置工具 allowlist 说明
 
-- 仅当请求 **未传入** `tools` 且 `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` 时启用。
-- 该模式不会注入外部工具桥接协议，也不会把 OpenCode 其他内置工具暴露给模型。
-- 代理会读取后端工具列表，并仅放行名为 `web_fetch`（或以 `.web_fetch` / `/web_fetch` 结尾）的内置工具，其余工具统一禁用。
-- 如果后端未提供 `web_fetch`，代理会回退到“全部内置工具禁用”的安全模式。
-- 一旦客户端显式传入 `tools`，请求立即回到现有外部工具桥接逻辑，内置工具继续保持禁用。
+- 当请求 **未传入** `tools` 时，代理会进入 internal allowlist 模式，并只允许 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 中声明的 OpenCode 内置工具。
+- `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` 仅作为兼容旧配置的快捷方式：当未显式配置 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 时，会默认把 allowlist 视为 `web_fetch`。
+- 代理会读取后端工具列表，并通过精确匹配或 `.<tool>` / `/<tool>` 后缀匹配解析最终可用工具。
+- 如果配置的 allowlist 在后端工具列表中一个也匹配不到，代理会自动回退到“全部内置工具禁用”的安全模式。
+- `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED=true` 时，代理会输出 internal allowlist 模式的调试/指标日志，包括模式选择、后端工具发现、allowlist 命中结果和降级原因，但不会记录工具返回内容。
+- `OPENCODE_TOOL_DISCOVERY_FIXTURE` 可用于集成测试或本地调试，绕过真实 `client.tool.ids()` 返回固定工具 ID 列表。
+- 一旦客户端显式传入 `tools`，请求立即回到现有外部工具桥接逻辑，OpenCode 内置工具继续保持禁用。
 
 ---
 
