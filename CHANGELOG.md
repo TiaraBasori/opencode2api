@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Anthropic Messages API**：新增 `POST /v1/messages`（`max_tokens` 必填，支持 `system`/`tools(input_schema)`/`tool_choice{auto,any,tool,none}`/`thinking→reasoning`/`image`；`tool_use.id` 原样往返；非流式回 `message` 对象，流式回 `message_start/content_block_*/message_delta/message_stop` 无 `[DONE]`；认证同时支持 `x-api-key`；CORS 放行 `x-api-key/anthropic-version`）。新增 `src/converters/anthropic.js` 纯函数转换层与 `tests/messages-anthropic.test.js`（9 例）。附带修复 `EXTERNAL_TOOL_PREFIX` 缺 import 的 latent `ReferenceError`。
 
+### Fixed
+
+- **后端错误透出**：`/v1/responses` 在后端 session 失败时曾 `throw` 纯对象，经 `transformUpstreamError` 被洗成 `500 Internal server error / code Object`、真实讯息丢失。新增 `normalizeBackendError`（纯对象→Error，保留 `data.message`/`name`/状态码推断），两处 `throw polled.error` 改用它；`transformUpstreamError` 纵深加固（默认分支改读 `data.message`/`name`，code 默认 `upstream_error` 不再用 `constructor.name`）。现 Credits 类错误正确回 `402 insufficient_quota` 并携带原文。新增 `tests/backend-error-surface.test.js`（4 例复现 LiteLLM 案例，含 messages）。
+- **同族错误路径查漏**：responses 串流 idleTimeout 补 poll 失败检查（不再静默回空 `completed`）；messages 非串流改用 transformed `status/type/code`（不再硬编码 `502/api_error`）；messages 串流检查 `collected.error` 与 poll 失败（失败即抛正規化错误走 SSE error 事件，不再静默 200）；`isTransientUpstreamError` 纳入 `name/code/type` 参与签名匹配（无 message 纯对象不再必判 false）。
+
 ## [1.5.0] - 2026-04-18
 
 ### Added
