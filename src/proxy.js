@@ -616,7 +616,7 @@ export function createApp(config) {
         API_KEY,
         OPENCODE_SERVER_URL,
         OPENCODE_SERVER_PASSWORD,
-        REQUEST_TIMEOUT_MS,
+        REQUEST_TIMEOUT_MS = DEFAULT_REQUEST_TIMEOUT_MS,
         DEBUG,
         DISABLE_TOOLS,
         INTERNAL_WEB_FETCH_ENABLED,
@@ -1233,10 +1233,11 @@ export function createApp(config) {
     };
 
     async function promptWithTimeout(promptParams, timeoutMs) {
-        const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
-        });
-        return Promise.race([client.session.prompt(promptParams), timeoutPromise]);
+        // Single timeout implementation: withTimeout clears its timer and
+        // swallows late rejections (old inline race leaked timers and could
+        // surface unhandled rejections). Message keeps 'Request timeout' so
+        // transformUpstreamError maps it to 504.
+        return withTimeout(client.session.prompt(promptParams), timeoutMs, 'prompt backend');
     }
 
     const getCleanupRoots = () => {
@@ -1643,7 +1644,8 @@ export function createApp(config) {
 
                     logDebug('Request params', { temperature: requestParams.temperature, max_tokens: requestParams.max_tokens, top_p: requestParams.top_p, reasoning_effort: reasoningLevel });
 
-                    const resolvedModel = await resolveRequestedModel(model);
+                    const resolvedModel = await withTimeout(
+                        resolveRequestedModel(model), REQUEST_TIMEOUT_MS, 'resolve model');
                     pID = resolvedModel.providerID;
                     mID = resolvedModel.modelID;
                     if (resolvedModel.aliasFrom) {
@@ -1810,8 +1812,9 @@ export function createApp(config) {
                         logDebug('Failed to set active model:', confError.message);
                     }
 
-                    // Create session
-                    const sessionRes = await client.session.create();
+                    // Create session (bounded: a hung backend must 504, not stall).
+                    const sessionRes = await withTimeout(
+                        client.session.create(), REQUEST_TIMEOUT_MS, 'create session');
                     sessionId = sessionRes.data?.id;
                     if (!sessionId) throw new Error('Failed to create OpenCode session');
                     logDebug('Session created', { sessionId });
@@ -1839,7 +1842,9 @@ export function createApp(config) {
                             ...(requestParams.stop && { stop: requestParams.stop })
                         }
                     };
-                    const toolOverrides = await getToolOverridesForMode(toolMode, internalToolContext);
+                    const toolOverrides = await withTimeout(
+                        getToolOverridesForMode(toolMode, internalToolContext),
+                        REQUEST_TIMEOUT_MS, 'load tool overrides');
                     if (toolOverrides && Object.keys(toolOverrides).length > 0) {
                         promptParams.body.tools = toolOverrides;
                     }
@@ -2397,6 +2402,15 @@ export function createApp(config) {
     });
 
     app.post('/v1/responses', async (req, res) => {
+        // Declared outside try so catch can stop the heartbeat on errors.
+        let responsesKeepalive = null;
+        let responsesResClosed = null;
+        const stopResponsesKeepalive = () => {
+            if (responsesKeepalive) {
+                clearInterval(responsesKeepalive);
+                responsesKeepalive = null;
+            }
+        };
         try {
             const {
                 model,
@@ -2561,7 +2575,30 @@ export function createApp(config) {
                 return res.status(400).json({ error: { message: 'input is required' } });
             }
 
-            const resolvedModel = await resolveRequestedModel(model || previousState?.model);
+            // Stream hardening: flush SSE headers + heartbeat BEFORE the slow
+            // backend awaits below, so middleboxes never see a zero-byte stall
+            // while resolve/session/subscribe are stuck on an overloaded host.
+            // (Non-stream responses skip this and answer with a single JSON.)
+            if (stream) {
+                res.setHeader('Content-Type', 'text/event-stream');
+                res.setHeader('Cache-Control', 'no-cache');
+                res.setHeader('Connection', 'keep-alive');
+                if (typeof res.flushHeaders === 'function') res.flushHeaders();
+                responsesKeepalive = setInterval(() => {
+                    if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n\n');
+                }, 15000);
+                // NOTE: req 'close' fires as soon as the (small) request body is
+                // parsed, long before the handler finishes, so it must NOT be
+                // used here. res 'close' with !writableEnded is the true
+                // client-disconnect signal.
+                responsesResClosed = new Promise((resolve) => res.once('close', () => {
+                    if (!res.writableEnded) resolve(true);
+                }));
+            }
+
+            const resolvedModel = await withTimeout(
+                resolveRequestedModel(model || previousState?.model),
+                REQUEST_TIMEOUT_MS, 'resolve model');
             const pID = resolvedModel.providerID;
             const mID = resolvedModel.modelID;
 
@@ -2577,7 +2614,8 @@ export function createApp(config) {
             // otherwise start a fresh one.
             let sessionId = previousState?.sessionId || null;
             if (!sessionId) {
-                const sessionRes = await client.session.create();
+                const sessionRes = await withTimeout(
+                    client.session.create(), REQUEST_TIMEOUT_MS, 'create session');
                 sessionId = sessionRes.data?.id;
                 if (!sessionId) {
                     throw new Error('Failed to create OpenCode session');
@@ -2610,7 +2648,9 @@ export function createApp(config) {
                 internalToolContext.allowedToolNames
             );
 
-            const toolOverrides = await getToolOverridesForMode(toolMode, internalToolContext);
+            const toolOverrides = await withTimeout(
+                getToolOverridesForMode(toolMode, internalToolContext),
+                REQUEST_TIMEOUT_MS, 'load tool overrides');
             const makeForcedResponsesToolCallRequester = () => createForcedToolCallRequester({
                 mode: externalToolChoice.mode,
                 sessionId,
@@ -2670,9 +2710,15 @@ export function createApp(config) {
             };
 
             if (stream) {
-                res.setHeader('Content-Type', 'text/event-stream');
-                res.setHeader('Cache-Control', 'no-cache');
-                res.setHeader('Connection', 'keep-alive');
+                // Headers + heartbeat already started before the preflight
+                // awaits above; response.created is the first semantic event.
+                // The client may have gone away during the bounded preflight
+                // waits — stop before emitting anything further.
+                if (res.destroyed || res.writableEnded) {
+                    stopResponsesKeepalive();
+                    try { if (!res.destroyed) res.end(); } catch {}
+                    return;
+                }
                 const responseId = `resp_${crypto.randomUUID()}`;
                 const messageOutputIndex = 0;
                 const reasoningOutputIndex = 1;
@@ -2833,7 +2879,15 @@ export function createApp(config) {
                     );
                     const safeCollect = collectPromise.catch((err) => ({ __error: err }));
                     client.session.prompt(promptParams).catch(err => logDebug('Responses prompt error:', err.message));
-                    collected = await safeCollect;
+                    collected = responsesResClosed
+                        ? await Promise.race([safeCollect, responsesResClosed.then(() => ({ __cancelled: true }))])
+                        : await safeCollect;
+                    if (collected?.__cancelled) {
+                        stopResponsesKeepalive();
+                        try { if (sessionId) await client.session.delete({ path: { id: sessionId } }); } catch (e) { logDebug('Failed to cleanup cancelled responses session', { error: e.message }); }
+                        try { if (!res.destroyed) res.end(); } catch {}
+                        return;
+                    }
                 } catch (e) {
                     collected = { __error: e };
                 }
@@ -2995,6 +3049,7 @@ export function createApp(config) {
                 emit({ type: 'response.completed', sequence_number: nextSeq(), response });
                 res.write('data: [DONE]\n\n');
                 storeResponseState(responseId, sessionId, `${pID}/${mID}`);
+                stopResponsesKeepalive();
                 return res.end();
             }
 
@@ -3027,7 +3082,11 @@ export function createApp(config) {
                 }
                 let polledResponse = null;
                 try {
-                    responseRes = await client.session.prompt(promptParams);
+                    // Bounded like chat/messages: a hung backend must surface
+                    // as an error, never as a silent zero-byte stall.
+                    // (withTimeout, not promptWithTimeout: a late backend
+                    // rejection must stay handled to avoid crashing the process.)
+                    responseRes = await withTimeout(client.session.prompt(promptParams), REQUEST_TIMEOUT_MS, 'prompt backend');
                     responseParts = responseRes.data?.parts || [];
                     promptContent = responseParts.filter(p => p.type === 'text').map(p => p.text).join('\n');
                     promptReasoning = responseParts.filter(p => p.type === 'reasoning').map(p => p.text).join('\n');
@@ -3132,6 +3191,7 @@ export function createApp(config) {
 
             return res.json(response);
         } catch (error) {
+            stopResponsesKeepalive();
             console.error('[Proxy] Responses API Error:', error?.message || error?.data?.message || error?.name || error);
             const transformed = transformUpstreamError(error);
             // Once the SSE headers are out, res.json() throws ERR_HTTP_HEADERS_SENT. That throw
@@ -3189,7 +3249,8 @@ export function createApp(config) {
                     };
                     if (top_k !== undefined) logDebug('Ignoring top_k (no opencode equivalent)', { top_k });
 
-                    const resolvedModel = await resolveRequestedModel(model);
+                    const resolvedModel = await withTimeout(
+                        resolveRequestedModel(model), REQUEST_TIMEOUT_MS, 'resolve model');
                     const pID = resolvedModel.providerID;
                     const mID = resolvedModel.modelID;
                     const publicModel = `${pID}/${mID}`;
@@ -3263,7 +3324,8 @@ export function createApp(config) {
                     try {
                         await client.config.update({ body: { activeModel: { providerID: pID, modelID: mID } } });
                     } catch (e) { logDebug('Failed to set active model', { error: e.message }); }
-                    const sessionRes = await client.session.create();
+                    const sessionRes = await withTimeout(
+                        client.session.create(), REQUEST_TIMEOUT_MS, 'create session');
                     sessionId = sessionRes.data?.id;
                     if (!sessionId) throw new Error('Failed to create OpenCode session');
 
@@ -3279,7 +3341,9 @@ export function createApp(config) {
                             ...(requestParams.stop && { stop: requestParams.stop })
                         }
                     };
-                    const toolOverrides = await getToolOverridesForMode(toolMode, internalToolContext);
+                    const toolOverrides = await withTimeout(
+                        getToolOverridesForMode(toolMode, internalToolContext),
+                        REQUEST_TIMEOUT_MS, 'load tool overrides');
                     if (toolOverrides && Object.keys(toolOverrides).length > 0) promptParams.body.tools = toolOverrides;
 
                     const fullPromptText = parts.map((p) => p.text || '').join('\n\n');
@@ -3384,8 +3448,14 @@ export function createApp(config) {
                     res.setHeader('Content-Type', 'text/event-stream');
                     res.setHeader('Cache-Control', 'no-cache');
                     res.setHeader('Connection', 'keep-alive');
-                    keepaliveInterval = setInterval(() => { if (!res.destroyed) res.write(': keep-alive\n\n'); }, 15000);
-                    const reqClosed = new Promise((resolve) => req.on('close', () => resolve(true)));
+                    keepaliveInterval = setInterval(() => { if (!res.destroyed && !res.writableEnded) res.write(': keep-alive\n\n'); }, 15000);
+                    // NOTE: req 'close' fires as soon as the request body is parsed
+                    // (before slow backend work finishes), so a listener attached
+                    // here would never observe a mid-stream disconnect. res 'close'
+                    // with !writableEnded is the true client-disconnect signal.
+                    const resClosed = new Promise((resolve) => res.once('close', () => {
+                        if (!res.writableEnded) resolve(true);
+                    }));
                     let streamedText = '';
                     let streamedReasoning = '';
                     let rawContent = '';
@@ -3443,7 +3513,7 @@ export function createApp(config) {
                     const collectPromise = collectFromEvents(sessionId, REQUEST_TIMEOUT_MS, sendDelta, DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS, DEFAULT_EVENT_IDLE_TIMEOUT_MS)
                         .catch((err) => ({ __error: err }));
                     client.session.prompt(promptParams).catch((err) => logDebug('Prompt error:', err.message));
-                    collected = await Promise.race([collectPromise, reqClosed.then(() => ({ __cancelled: true }))]);
+                    collected = await Promise.race([collectPromise, resClosed.then(() => ({ __cancelled: true }))]);
                     if (collected?.__cancelled) {
                         if (keepaliveInterval) clearInterval(keepaliveInterval);
                         try { if (sessionId) await client.session.delete({ path: { id: sessionId } }); } catch (e) { logDebug('Failed to cleanup cancelled messages session', { error: e.message }); }
@@ -3751,25 +3821,70 @@ async function ensureBackend(config) {
 }
 
 /**
+ * Normalize a boolean-ish value. Returns true/false for recognized spellings,
+ * undefined for missing/invalid values so callers can fall through with ??.
+ * Numbers: only 0/1 are recognized (like '0'/'1'); any other number is
+ * treated as unset so it never blocks a lower-priority source.
+ */
+export function normalizeBool(value) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') {
+        if (value === 1) return true;
+        if (value === 0) return false;
+        return undefined;
+    }
+    if (typeof value === 'string') {
+        const v = value.trim().toLowerCase();
+        if (['1', 'true', 'yes', 'y', 'on'].includes(v)) return true;
+        if (['0', 'false', 'no', 'n', 'off'].includes(v)) return false;
+    }
+    return undefined;
+}
+
+/**
+ * Resolve the effective disable-tools flag.
+ * Precedence: options.DISABLE_TOOLS > options.disableTools >
+ * env OPENCODE_DISABLE_TOOLS (canonical) > env DISABLE_TOOLS (legacy alias
+ * used by docker-compose/.env) > fallback.
+ * Invalid values ('garbage', '', whitespace) are treated as unset and fall
+ * through to the next source instead of coercing.
+ */
+export function resolveDisableTools(options, fallback = false) {
+    const o = options ?? {};
+    return normalizeBool(o.DISABLE_TOOLS) ??
+        normalizeBool(o.disableTools) ??
+        normalizeBool(process.env.OPENCODE_DISABLE_TOOLS) ??
+        normalizeBool(process.env.DISABLE_TOOLS) ??
+        fallback;
+}
+
+/**
+ * Race a promise against a timeout. The real outcome always wins: fast
+ * resolutions/rejections settle the race immediately; only a never-settling
+ * promise loses to the timer. A no-op handler is attached so a late rejection
+ * can never surface as an unhandled rejection (which would terminate the
+ * process under Node's default --unhandled-rejections=throw).
+ * The timeout error message keeps the 'Request timeout' prefix so
+ * transformUpstreamError maps it to 504 (not 500); the label is appended
+ * for diagnosability.
+ */
+export function withTimeout(promise, timeoutMs, label = 'operation') {
+    const ms = Number.isFinite(Number(timeoutMs)) ? Number(timeoutMs) : DEFAULT_REQUEST_TIMEOUT_MS;
+    let timer;
+    const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Request timeout after ${ms}ms (${label})`)), ms);
+    });
+    if (promise && typeof promise.catch === 'function') promise.catch(() => {});
+    return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+}
+
+/**
  * Starts the OpenCode-to-OpenAI Proxy server.
  */
-export function startProxy(options) {
-    const normalizeBool = (value) => {
-        if (typeof value === 'boolean') return value;
-        if (typeof value === 'number') return value === 1;
-        if (typeof value === 'string') {
-            const v = value.trim().toLowerCase();
-            if (['1', 'true', 'yes', 'y', 'on'].includes(v)) return true;
-            if (['0', 'false', 'no', 'n', 'off'].includes(v)) return false;
-        }
-        return undefined;
-    };
-
-    const disableTools =
-        normalizeBool(options.DISABLE_TOOLS) ??
-        normalizeBool(options.disableTools) ??
-        normalizeBool(process.env.OPENCODE_DISABLE_TOOLS) ??
-        false;
+export function startProxy(options = {}) {
+    // Also tolerate explicit null (the = {} default only covers undefined).
+    options = options ?? {};
+    const disableTools = resolveDisableTools(options);
 
     const promptMode = options.PROMPT_MODE || options.promptMode || process.env.OPENCODE_PROXY_PROMPT_MODE || 'standard';
     const externalToolsMode = options.EXTERNAL_TOOLS_MODE || options.externalToolsMode || process.env.OPENCODE_EXTERNAL_TOOLS_MODE || 'proxy-bridge';
@@ -3790,7 +3905,7 @@ export function startProxy(options) {
         OPENCODE_SERVER_URL: options.OPENCODE_SERVER_URL || 'http://127.0.0.1:10001',
         OPENCODE_SERVER_PASSWORD: options.OPENCODE_SERVER_PASSWORD || process.env.OPENCODE_SERVER_PASSWORD || '',
         OPENCODE_PATH: options.OPENCODE_PATH || 'opencode',
-        BIND_HOST: options.BIND_HOST || options.bindHost || process.env.OPENCODE_PROXY_BIND_HOST || '0.0.0.0',
+        BIND_HOST: options.BIND_HOST || options.bindHost || process.env.BIND_HOST || process.env.OPENCODE_PROXY_BIND_HOST || '0.0.0.0',
         USE_ISOLATED_HOME: typeof options.USE_ISOLATED_HOME === 'boolean'
             ? options.USE_ISOLATED_HOME
             : String(options.USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||

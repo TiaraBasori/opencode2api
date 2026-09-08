@@ -1,4 +1,4 @@
-import { startProxy } from './src/proxy.js';
+import { startProxy, normalizeBool, resolveDisableTools } from './src/proxy.js';
 import { resolveMaxRetries } from './src/retry/policy.js';
 import fs from 'fs';
 import path from 'path';
@@ -78,8 +78,17 @@ const finalConfig = {
     OPENCODE_SERVER_PASSWORD: process.env.OPENCODE_SERVER_PASSWORD || fileConfig.OPENCODE_SERVER_PASSWORD || defaultConfig.OPENCODE_SERVER_PASSWORD,
     MANAGE_BACKEND: parseBool(process.env.OPENCODE_PROXY_MANAGE_BACKEND, parseBool(fileConfig.MANAGE_BACKEND, defaultConfig.MANAGE_BACKEND)),
     OPENCODE_PATH: process.env.OPENCODE_PATH || fileConfig.OPENCODE_PATH || defaultConfig.OPENCODE_PATH,
-    BIND_HOST: process.env.BIND_HOST || fileConfig.BIND_HOST || defaultConfig.BIND_HOST,
-    DISABLE_TOOLS: parseBool(process.env.OPENCODE_DISABLE_TOOLS, parseBool(fileConfig.DISABLE_TOOLS, defaultConfig.DISABLE_TOOLS)),
+    BIND_HOST: process.env.BIND_HOST || process.env.OPENCODE_PROXY_BIND_HOST || fileConfig.BIND_HOST || defaultConfig.BIND_HOST,
+    // Single contract via resolveDisableTools: env canonical > env legacy
+    // alias > file > default. Each source is normalized first so invalid
+    // values ('', 'garbage') fall through instead of blocking lower sources.
+    DISABLE_TOOLS: resolveDisableTools(
+        {
+            DISABLE_TOOLS: process.env.OPENCODE_DISABLE_TOOLS,
+            disableTools: process.env.DISABLE_TOOLS,
+        },
+        normalizeBool(fileConfig.DISABLE_TOOLS) ?? defaultConfig.DISABLE_TOOLS,
+    ),
     EXTERNAL_TOOLS_MODE: process.env.OPENCODE_EXTERNAL_TOOLS_MODE || fileConfig.EXTERNAL_TOOLS_MODE || defaultConfig.EXTERNAL_TOOLS_MODE,
     EXTERNAL_TOOLS_CONFLICT_POLICY: process.env.OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY || fileConfig.EXTERNAL_TOOLS_CONFLICT_POLICY || defaultConfig.EXTERNAL_TOOLS_CONFLICT_POLICY,
     INTERNAL_WEB_FETCH_ENABLED: parseBool(process.env.OPENCODE_INTERNAL_WEB_FETCH_ENABLED, parseBool(fileConfig.INTERNAL_WEB_FETCH_ENABLED, defaultConfig.INTERNAL_WEB_FETCH_ENABLED)),

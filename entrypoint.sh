@@ -45,7 +45,9 @@ if [[ "$1" == "opencode" && "$2" == "serve" ]]; then
     SERVER_PID=$!
     
     echo "Waiting for OpenCode Server to become available..."
-    MAX_RETRIES=30
+    # Cold start on small (1GB) hosts can take minutes; do not kill early.
+    MAX_RETRIES=90
+    RETRY_DELAY=2
     COUNT=0
     while ! curl -s -m 5 http://127.0.0.1:${SERVER_PORT}/health > /dev/null; do
         if [ $COUNT -ge $MAX_RETRIES ]; then
@@ -53,13 +55,13 @@ if [[ "$1" == "opencode" && "$2" == "serve" ]]; then
             kill $SERVER_PID 2>/dev/null
             exit 1
         fi
-        
+
         if ! kill -0 $SERVER_PID 2>/dev/null; then
             echo "OpenCode Server process died unexpectedly."
             exit 1
         fi
-        
-        sleep 1
+
+        sleep $RETRY_DELAY
         COUNT=$((COUNT+1))
     done
     echo "OpenCode Server is up!"
