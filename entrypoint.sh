@@ -72,7 +72,7 @@ if [[ "$1" == "opencode" && "$2" == "serve" ]]; then
     echo "OpenCode Server is up!"
 
     echo "Starting OpenAI Proxy on port ${PROXY_PORT}..."
-    exec gosu node node index.js
+    exec gosu node node dist/index.js
 else
     exec gosu node "$@"
 fi

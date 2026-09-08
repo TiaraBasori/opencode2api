@@ -69,10 +69,15 @@ git clone https://github.com/samson910022/OpenCode2API.git
 cd OpenCode2API
 npm install
 
+# Typecheck / build (TS source: index.ts + src/**/*.ts, output: dist/)
+npm run typecheck
+npm run build
+
 # Run tests
 npm test
 
-# Start locally
+# Start locally (dev: tsx watch index.ts / prod: node dist/index.js)
+npm run dev
 npm start
 ```
 
@@ -80,6 +85,8 @@ npm start
 
 - Unit tests: `npm run test:unit`
 - Integration tests: `npm run test:integration`
+- Typecheck: `npm run typecheck`
+- Build: `npm run build`
 - All tests: `npm test -- --runInBand`
 
 ## Code Review Process

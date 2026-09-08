@@ -11,3 +11,4 @@ tests
 *.log
 .env
 .env.*
+dist/

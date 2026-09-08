@@ -30,12 +30,26 @@ export const RETRY_JITTER_FACTOR = 0.25;
 export const MAX_DELAY_NO_HEADERS_MS = 30000;
 export const MAX_HEADER_DELAY_MS = 30000;
 
+/** Raw response-header bag carrying provider retry hints (case-insensitive). */
+export type RetryHeaders = Record<string, string | number | undefined>;
+
+/** Minimal shape of an error that may carry provider retry signals. */
+export interface RetryErrorLike {
+    responseHeaders?: RetryHeaders | null;
+    data?: { responseHeaders?: RetryHeaders | null } | null;
+}
+
+/** Raw retry configuration source (e.g. env / file / defaults merge). */
+export interface RetryPolicyConfig {
+    maxRetries?: unknown;
+}
+
 /**
  * Resolve the configured max-retry count to an integer in [0, 5].
  * Non-numeric / missing values fall back to DEFAULT_MAX_RETRIES (3).
  */
-export function resolveMaxRetries(value) {
-    const n = typeof value === 'number' ? value : parseInt(value, 10);
+export function resolveMaxRetries(value: unknown): number {
+    const n = typeof value === 'number' ? value : parseInt(value as string, 10);
     if (!Number.isFinite(n)) return DEFAULT_MAX_RETRIES;
     const floored = Math.floor(n);
     if (floored < 0) return 0;
@@ -49,30 +63,31 @@ export function resolveMaxRetries(value) {
  * retry-after (HTTP date). Invalid / past values yield null (caller falls
  * back to exponential). Header names are matched case-insensitively.
  */
-export function parseRetryAfterMs(headers) {
+export function parseRetryAfterMs(headers: unknown): number | null {
     if (!headers || typeof headers !== 'object') return null;
-    const lookup = (name) => {
-        for (const key of Object.keys(headers)) {
-            if (key.toLowerCase() === name) return headers[key];
+    const record = headers as Record<string, unknown>;
+    const lookup = (name: string): unknown => {
+        for (const key of Object.keys(record)) {
+            if (key.toLowerCase() === name) return record[key];
         }
         return undefined;
     };
     const msRaw = lookup('retry-after-ms');
     if (msRaw !== undefined) {
-        const ms = Number.parseFloat(msRaw);
+        const ms = Number.parseFloat(msRaw as string);
         if (!Number.isNaN(ms) && ms >= 0) return Math.ceil(ms);
     }
     const afterRaw = lookup('retry-after');
     if (afterRaw !== undefined && afterRaw !== null && afterRaw !== '') {
-        const seconds = Number.parseFloat(afterRaw);
+        const seconds = Number.parseFloat(afterRaw as string);
         if (!Number.isNaN(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
-        const dateMs = Date.parse(afterRaw) - Date.now();
+        const dateMs = Date.parse(afterRaw as string) - Date.now();
         if (!Number.isNaN(dateMs) && dateMs > 0) return Math.ceil(dateMs);
     }
     return null;
 }
 
-function exponentialDelay(attempt, random) {
+function exponentialDelay(attempt: number, random: number): number {
     const base = RETRY_INITIAL_DELAY_MS * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1);
     return Math.ceil(base + base * RETRY_JITTER_FACTOR * random);
 }
@@ -82,10 +97,11 @@ function exponentialDelay(attempt, random) {
  * preceding the 2nd overall attempt is attempt=1 → ~2000ms).
  * error may carry responseHeaders directly or under .data (backend shape).
  */
-export function computeRetryDelay(attempt, error = null, random = Math.random()) {
-    const safeAttempt = Number.isFinite(attempt) && attempt > 0 ? Math.floor(attempt) : 1;
+export function computeRetryDelay(attempt: unknown, error: unknown = null, random: unknown = Math.random()): number {
+    const safeAttempt = typeof attempt === 'number' && Number.isFinite(attempt) && attempt > 0 ? Math.floor(attempt) : 1;
     const safeRandom = typeof random === 'number' && random >= 0 && random <= 1 ? random : Math.random();
-    const headers = error?.responseHeaders ?? error?.data?.responseHeaders ?? null;
+    const candidate = error as RetryErrorLike | null | undefined;
+    const headers = candidate?.responseHeaders ?? candidate?.data?.responseHeaders ?? null;
     const hinted = parseRetryAfterMs(headers);
     if (hinted !== null) return Math.min(hinted, MAX_HEADER_DELAY_MS);
     return Math.min(exponentialDelay(safeAttempt, safeRandom), MAX_DELAY_NO_HEADERS_MS);

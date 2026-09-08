@@ -2,10 +2,13 @@
   "name": "opencode2api",
   "version": "1.6.0",
   "description": "An OpenAI-compatible API gateway for the OpenCode CLI, enabling the use of free models (Kimi, GLM, MiniMax) in standard AI clients.",
-  "main": "index.js",
+  "main": "dist/index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js",
+    "start": "node dist/index.js",
+    "dev": "tsx watch index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --runInBand --detectOpenHandles",
     "test:unit": "npm test",
     "test:integration": "bash tests/test-integration.sh"
@@ -41,7 +44,16 @@
     "express": "^4.21.2"
   },
   "devDependencies": {
+    "@swc/core": "^1.16.2",
+    "@swc/jest": "^0.2.39",
+    "@types/body-parser": "^1.19.6",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.25",
+    "@types/node": "^20.19.43",
+    "@types/supertest": "^7.2.1",
     "jest": "^30.2.0",
-    "supertest": "^7.2.2"
+    "supertest": "^7.2.2",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
   }
 }

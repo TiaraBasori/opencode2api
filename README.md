@@ -61,6 +61,7 @@ git clone https://github.com/samson910022/OpenCode2API.git
 cd OpenCode2API
 npm install
 cp config.json.example config.json
+npm run build
 npm start
 ```
 
@@ -311,12 +312,26 @@ USE_ISOLATED_HOME=false  # 让 OpenCode 复用本地登录态
 ## 🔨 开发
 
 ```bash
+# 类型检查（tsc --noEmit）
+npm run typecheck
+
+# 构建（tsc -> dist/，入口 dist/index.js）
+npm run build
+
+# 本地开发（tsx watch，源码入口 index.ts）
+npm run dev
+
+# 生产启动（运行构建产物）
+npm start
+
 # 运行测试
 npm test -- --runInBand
 
 # Docker 开发
 docker compose up -d --build
 ```
+
+> TypeScript 源码：`index.ts` + `src/**/*.ts`；构建产物：`dist/`（`dist/index.js` 为运行时入口，本地 `dist/` 不进 git/docker context）。
 
 ---
 

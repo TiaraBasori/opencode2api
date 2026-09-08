@@ -3,7 +3,7 @@ import { resolveDisableTools, normalizeBool } from '../src/proxy.js';
 // Regression tests: docker-compose/.env document DISABLE_TOOLS, but the code
 // only honored OPENCODE_DISABLE_TOOLS, so a legacy DISABLE_TOOLS=true was
 // silently ignored. Note the unit default here is false; the production
-// default (true) comes from index.js passing defaultConfig as fallback.
+// default (true) comes from index.ts passing defaultConfig as fallback.
 describe('resolveDisableTools', () => {
     const CANONICAL = 'OPENCODE_DISABLE_TOOLS';
     const LEGACY = 'DISABLE_TOOLS';
@@ -118,9 +118,9 @@ describe('resolveDisableTools', () => {
     });
 });
 
-// index.js cannot be imported directly (it starts the server), so mirror its
+// index.ts cannot be imported directly (it starts the server), so mirror its
 // exact resolution call here to pin the env > file > default contract.
-// index.js calls resolveDisableTools({DISABLE_TOOLS: canonical,
+// index.ts calls resolveDisableTools({DISABLE_TOOLS: canonical,
 // disableTools: legacy}, normalizeBool(file) ?? default).
 describe('index.js DISABLE_TOOLS chain (mirrored)', () => {
     const resolveIndexChain = (env, fileConfig, defaultValue) =>

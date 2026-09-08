@@ -44,7 +44,8 @@
 | 3. 安装依赖 | `npm install` |
 | 4. 复制配置 | `cp config.json.example config.json` |
 | 5. 安装 CLI | `npm install -g opencode-ai` |
-| 6. 启动服务 | `npm start` |
+| 6. 构建产物 | `npm run build` |
+| 7. 启动服务 | `npm start` |
 
 ---
 

@@ -1,3 +1,20 @@
+# P5: multi-stage — builder compiles TS -> dist, runtime ships only prod deps + dist.
+# Local `dist/` stays in .dockerignore (never enters context); the runtime
+# COPY --from=builder bypasses the ignore because it copies from the build
+# stage filesystem, not from the build context.
+FROM node:lts-slim AS builder
+
+WORKDIR /build
+
+COPY package*.json ./
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY index.ts ./
+COPY src ./src
+RUN npm run build
+
+# ---------------- runtime ----------------
 FROM node:lts-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -23,9 +40,10 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 WORKDIR /home/node/project
 
 COPY package*.json ./
-RUN npm install --production
+RUN npm ci --omit=dev
 
-COPY . .
+COPY --from=builder /build/dist ./dist
+RUN chown -R node:node /home/node/project
 
 EXPOSE 10000 10001
 

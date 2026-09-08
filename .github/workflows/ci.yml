@@ -26,6 +26,8 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
       - run: npm test -- --runInBand
 
   shellcheck:
@@ -60,5 +62,27 @@ jobs:
           context: .
           file: ./Dockerfile
           push: false
+          load: true
+          tags: opencode2api:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # Minimal smoke: run the compiled proxy directly (bypass opencode
+      # backend wait) and probe the auth-free shallow /health endpoint.
+      # `node dist/index.js` hits the entrypoint else-branch
+      # (exec gosu node "$@") so no backend credentials are needed.
+      - name: Smoke test built image (/health)
+        run: |
+          docker run -d --name opencode2api-smoke -p 10000:10000 opencode2api:ci node dist/index.js
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:10000/health; then
+              echo
+              echo "smoke: /health 200"
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          docker logs opencode2api-smoke || true
+          docker rm -f opencode2api-smoke || true
+          test "$ok" = "1"

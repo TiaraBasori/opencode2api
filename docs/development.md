@@ -41,6 +41,11 @@ curl -fsSL https://opencode.ai/install | bash
 ### 启动开发服务器
 
 ```bash
+# 开发（tsx watch，直接跑 TS 源码 index.ts）
+npm run dev
+
+# 生产（先构建再跑产物 dist/index.js）
+npm run build
 npm start
 ```
 
@@ -58,6 +63,10 @@ cp config.json.example config.json
 
 | 命令 | 说明 |
 |:-----|:-----|
+| `npm run dev` | 开发模式（tsx watch `index.ts`） |
+| `npm run typecheck` | 类型检查（`tsc --noEmit`） |
+| `npm run build` | 构建到 `dist/`（入口 `dist/index.js`） |
+| `npm start` | 生产启动（`node dist/index.js`） |
 | `npm test -- --runInBand` | 运行所有测试 |
 | `npm run test:unit` | 运行单元测试 |
 | `npm run test:integration` | 运行集成测试 |
@@ -103,16 +112,16 @@ chore: update build/ci
 
 ```
 OpenCode2API/
-├── src/
-│   └── proxy.js           # 核心代理逻辑
+├── index.ts            # 入口（TS 源码）
+├── src/**/*.ts         # 核心代理逻辑（TS）
+├── dist/               # 构建产物（tsc 输出，运行时入口 dist/index.js，不进 git）
 ├── tests/
 │   ├── app.test.js       # 单元测试
 │   ├── test-integration.sh   # 集成测试
 │   └── test-streaming-real.sh # 流式测试
 ├── docs/                 # 文档
-├── index.js             # 入口文件
 ├── package.json         # 项目配置
-├── Dockerfile           # Docker 镜像
+├── Dockerfile           # Docker 镜像（多阶段：builder -> runtime）
 └── docker-compose.yml   # Docker Compose
 ```
 
