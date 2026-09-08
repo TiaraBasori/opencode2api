@@ -64,6 +64,13 @@ function isTransientUpstreamError(error) {
     // whatever the status code. Explicit false defers to the checks below.
     if (error.isRetryable === true || error.data?.isRetryable === true) return true;
 
+    // Genuine auth failures must surface immediately: a misconfigured key
+    // should not burn the full backoff. The issue-#5 mislabeled billing case
+    // ("Insufficient balance"/CreditsError) never carries these strings, so
+    // it still retries. Placed after isRetryable so a provider-explicit
+    // retryable flag keeps winning (upstream-faithful).
+    if (/invalid api key|unauthorized|authentication failed/i.test(message)) return false;
+
     const transientSignatures = [
         /insufficient balance/i,
         /credits?error/i,
@@ -2164,12 +2171,22 @@ export function createApp(config) {
                                 await sleep(computeRetryDelay(attempt - 1, error));
                             }
                             const attemptStart = Date.now();
-                            await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                            logDebug('Prompt sent', { sessionId, ms: Date.now() - attemptStart, attempt });
-                            const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                            content = collected.content || '';
-                            reasoning = collected.reasoning || '';
-                            error = collected.error || null;
+                            try {
+                                await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                                logDebug('Prompt sent', { sessionId, ms: Date.now() - attemptStart, attempt });
+                                const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                                content = collected.content || '';
+                                reasoning = collected.reasoning || '';
+                                error = collected.error || null;
+                            } catch (promptError) {
+                                // Transport-level throw (fetch failed, ECONNRESET, prompt
+                                // timeout): route through the same transient check as a
+                                // poll-observed error. Non-matching throws (e.g. our own
+                                // request timeout) fall through to surfacing below.
+                                content = '';
+                                reasoning = '';
+                                error = promptError;
+                            }
                             // Bounded retry for upstream throttling mislabeled as billing
                             // errors (401 CreditsError etc.); only when nothing usable was
                             // produced, so real failures still surface after maxAttempts.
@@ -2993,16 +3010,28 @@ export function createApp(config) {
                     requestForcedResponsesToolCall = makeForcedResponsesToolCallRequester();
                     await sleep(computeRetryDelay(attempt - 1, lastResponsesAttemptError));
                 }
-                responseRes = await client.session.prompt(promptParams);
-                responseParts = responseRes.data?.parts || [];
-                promptContent = responseParts.filter(p => p.type === 'text').map(p => p.text).join('\n');
-                promptReasoning = responseParts.filter(p => p.type === 'reasoning').map(p => p.text).join('\n');
-                promptParsedToolCalls = externalToolRegistry.length > 0
-                    ? parseExternalToolCallsFromText(externalToolRegistry, promptReasoning, promptContent)
-                    : [];
-                if (promptContent || promptReasoning) break;
-                const polledResponse = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                if (polledResponse.error && !polledResponse.content && !polledResponse.reasoning) {
+                let polledResponse = null;
+                try {
+                    responseRes = await client.session.prompt(promptParams);
+                    responseParts = responseRes.data?.parts || [];
+                    promptContent = responseParts.filter(p => p.type === 'text').map(p => p.text).join('\n');
+                    promptReasoning = responseParts.filter(p => p.type === 'reasoning').map(p => p.text).join('\n');
+                    promptParsedToolCalls = externalToolRegistry.length > 0
+                        ? parseExternalToolCallsFromText(externalToolRegistry, promptReasoning, promptContent)
+                        : [];
+                    if (promptContent || promptReasoning) break;
+                    polledResponse = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                } catch (loopError) {
+                    // Transport-level throw (fetch failed, ECONNRESET, poll timeout):
+                    // same transient routing as a poll-observed error.
+                    if (attempt < maxAttempts && isTransientUpstreamError(loopError)) {
+                        console.warn(`[Proxy] Transient upstream error (attempt ${attempt}/${maxAttempts}), retrying:`, loopError.data?.message || loopError.message || loopError.name || 'unknown');
+                        lastResponsesAttemptError = loopError;
+                        continue;
+                    }
+                    throw normalizeBackendError(loopError);
+                }
+                if (polledResponse && polledResponse.error && !polledResponse.content && !polledResponse.reasoning) {
                     if (attempt < maxAttempts && isTransientUpstreamError(polledResponse.error)) {
                         console.warn(`[Proxy] Transient upstream error (attempt ${attempt}/${maxAttempts}), retrying:`, polledResponse.error.data?.message || polledResponse.error.message || polledResponse.error.name || 'unknown');
                         lastResponsesAttemptError = polledResponse.error;
@@ -3010,9 +3039,11 @@ export function createApp(config) {
                     }
                     throw normalizeBackendError(polledResponse.error);
                 }
-                content = polledResponse.content || content;
-                reasoning = polledResponse.reasoning || reasoning;
-                polledFilled = true;
+                if (polledResponse) {
+                    content = polledResponse.content || content;
+                    reasoning = polledResponse.reasoning || reasoning;
+                    polledFilled = true;
+                }
                 break;
             }
 
@@ -3288,11 +3319,19 @@ export function createApp(config) {
                                 requestForcedMessagesToolCall = makeForcedMessagesToolCallRequester();
                                 await sleep(computeRetryDelay(attempt - 1, error));
                             }
-                            await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                            const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                            content = collected.content || '';
-                            reasoning = collected.reasoning || '';
-                            error = collected.error || null;
+                            try {
+                                await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                                const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                                content = collected.content || '';
+                                reasoning = collected.reasoning || '';
+                                error = collected.error || null;
+                            } catch (promptError) {
+                                // Transport-level throw (fetch failed, ECONNRESET, prompt
+                                // timeout): same transient routing as poll errors.
+                                content = '';
+                                reasoning = '';
+                                error = promptError;
+                            }
                             if (error && !content && !reasoning && attempt < maxAttempts && isTransientUpstreamError(error)) continue;
                             break;
                         }

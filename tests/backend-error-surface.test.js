@@ -190,4 +190,59 @@ describe('POST /v1/responses backend plain-object error', () => {
             expect(sdkMocks.sessionCreate.mock.calls.length).toBe(6);
         });
     });
+
+    describe('prompt-layer throw + genuine auth (chat non-stream)', () => {
+        const buildApp = (retries) => createApp({
+            PORT: 10000, API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000, DISABLE_TOOLS: true, DEBUG: false,
+            RETRY_MAX_RETRIES: retries
+        }).app;
+
+        test('prompt throw with transient signature retries then succeeds', async () => {
+            const throwErr = new Error('fetch failed: socket hang up');
+            throwErr.responseHeaders = { 'retry-after-ms': '10' };
+            sdkMocks.sessionPrompt
+                .mockRejectedValueOnce(throwErr)
+                .mockResolvedValue({ data: { parts: [] } });
+            sdkMocks.sessionMessages.mockImplementation(async () => ([
+                { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'recovered-prompt' }] }
+            ]));
+            const chatApp = buildApp(undefined);
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+            expect(res.statusCode).toBe(200);
+            expect(JSON.stringify(res.body)).toContain('recovered-prompt');
+            expect(sdkMocks.sessionCreate.mock.calls.length).toBe(2);
+        });
+
+        test('genuine auth failure surfaces immediately without retry', async () => {
+            sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
+            sdkMocks.sessionMessages.mockImplementation(async () => ([
+                { info: { role: 'assistant', finish: 'stop', error: { name: 'ProviderAuthError', data: { message: 'Invalid API key for provider' } } }, parts: [] }
+            ]));
+            const chatApp = buildApp(undefined);
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+            expect(res.statusCode).toBe(502);
+            expect(JSON.stringify(res.body)).toContain('Invalid API key');
+            expect(sdkMocks.sessionCreate.mock.calls.length).toBe(1);
+        });
+
+        test('genuine auth failure with 401 status still skips retry', async () => {
+            sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
+            sdkMocks.sessionMessages.mockImplementation(async () => ([
+                { info: { role: 'assistant', finish: 'stop', error: { name: 'ProviderAuthError', data: { message: '401: Invalid API key', status: 401 } } }, parts: [] }
+            ]));
+            const chatApp = buildApp(undefined);
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+            // Without the early-false, status 401 alone would trigger retries.
+            expect(res.statusCode).toBe(502);
+            expect(sdkMocks.sessionCreate.mock.calls.length).toBe(1);
+        });
+    });
 });

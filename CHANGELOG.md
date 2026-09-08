@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Anthropic Messages API**：新增 `POST /v1/messages`（`max_tokens` 必填，支持 `system`/`tools(input_schema)`/`tool_choice{auto,any,tool,none}`/`thinking→reasoning`/`image`；`tool_use.id` 原样往返；非流式回 `message` 对象，流式回 `message_start/content_block_*/message_delta/message_stop` 无 `[DONE]`；认证同时支持 `x-api-key`；CORS 放行 `x-api-key/anthropic-version`）。新增 `src/converters/anthropic.js` 纯函数转换层与 `tests/messages-anthropic.test.js`（9 例）。附带修复 `EXTERNAL_TOOL_PREFIX` 缺 import 的 latent `ReferenceError`。
-- **官方对齐重试策略**：移植上游 `session/retry.ts`（`2s×2ⁿ⁻¹` 指数退避 +25% jitter；优先 `retry-after-ms`/`retry-after`，header 等待 clamp 30s；`5xx` 强制、`isRetryable`、`ContextOverflow` 永不）。重试次数 `n` 经 `OPENCODE_PROXY_RETRY_MAX_RETRIES` 控制（默认 3，总尝试 1+n，上限对齐官方 5）。chat 双路由与 messages 非串流改用新退避；responses 非串流新增同结构重试迴圈（仅无产出且 transient 时；responses/messages 串流保持单次尝试）。新增 `src/retry/policy.js` 与 `tests/retry-policy.test.js`（11 例）及接线测试 4 例。
+- **官方对齐重试策略**：移植上游 `session/retry.ts`（`2s×2ⁿ⁻¹` 指数退避 +25% jitter；优先 `retry-after-ms`/`retry-after`，header 等待 clamp 30s；`5xx` 强制、`isRetryable`、`ContextOverflow` 永不）。重试次数 `n` 经 `OPENCODE_PROXY_RETRY_MAX_RETRIES` 控制（默认 3，总尝试 1+n，上限对齐官方 5）。chat 双路由与 messages 非串流改用新退避；responses 非串流新增同结构重试迴圈（仅无产出且 transient 时；responses/messages 串流保持单次尝试）。三处非串流的 prompt/poll 抛错同样走 transient 重试路由（传输层 throw 不再直接逃逸）；真鉴权失败（invalid api key/unauthorized/authentication failed）立即透出不再烧退避。新增 `src/retry/policy.js` 与 `tests/retry-policy.test.js`（11 例）及接线测试 7 例。
 
 ### Fixed
 
