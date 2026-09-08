@@ -2509,16 +2509,18 @@ export function createApp(config) {
                 arguments: toolCall.function.arguments
             });
 
-            const buildResponsesMessageOutputItem = (text) => {
+            const buildResponsesMessageOutputItem = (text, messageId = `msg_${crypto.randomUUID()}`) => {
                 if (!text) return null;
                 return {
+                    id: messageId,
                     type: 'message',
                     role: 'assistant',
                     status: 'completed',
                     content: [
                         {
                             type: 'output_text',
-                            text
+                            text,
+                            annotations: []
                         }
                     ]
                 };
@@ -2542,10 +2544,11 @@ export function createApp(config) {
                 const nextSeq = () => sequenceNumber++;
                 const emit = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
+                const createdAt = Math.floor(Date.now() / 1000);
                 emit({
                     type: 'response.created',
                     sequence_number: nextSeq(),
-                    response: { id: responseId, object: 'response', created: Math.floor(Date.now() / 1000), model: `${pID}/${mID}` }
+                    response: { id: responseId, object: 'response', created: createdAt, created_at: createdAt, status: 'in_progress', model: `${pID}/${mID}` }
                 });
 
                 const shouldStripStreamingToolMarkup = externalToolRegistry.length > 0;
@@ -2579,7 +2582,7 @@ export function createApp(config) {
                             output_index: messageOutputIndex,
                             content_index: contentIndex,
                             item_id: outputItemId,
-                            part: { type: 'output_text', text: '' }
+                            part: { type: 'output_text', text: '', annotations: [] }
                         });
                         announcedContent = true;
                     }
@@ -2751,7 +2754,7 @@ export function createApp(config) {
                         output_index: messageOutputIndex,
                         content_index: contentIndex,
                         item_id: outputItemId,
-                        part: { type: 'output_text', text: content }
+                        part: { type: 'output_text', text: content, annotations: [] }
                     });
                     emit({
                         type: 'response.output_item.done',
@@ -2762,7 +2765,7 @@ export function createApp(config) {
                             type: 'message',
                             status: 'completed',
                             role: 'assistant',
-                            content: [{ type: 'output_text', text: content }]
+                            content: [{ type: 'output_text', text: content, annotations: [] }]
                         }
                     });
                 }
@@ -2817,7 +2820,7 @@ export function createApp(config) {
                     });
                 }
                 const streamOutput = [];
-                const streamMessageOutputItem = buildResponsesMessageOutputItem(safeContent && safeContent.trim() ? safeContent : '');
+                const streamMessageOutputItem = buildResponsesMessageOutputItem(safeContent && safeContent.trim() ? safeContent : '', outputItemId);
                 if (streamMessageOutputItem) streamOutput.push(streamMessageOutputItem);
                 validatedStreamedToolCalls.forEach((toolCall) => {
                     streamOutput.push(buildResponsesFunctionCallOutputItem(toolCall));
@@ -2825,13 +2828,18 @@ export function createApp(config) {
                 const promptTokens = Math.ceil(fullPromptText.length / 4);
                 const completionTokens = Math.ceil(content.length / 4);
                 const reasoningTokens = Math.ceil(reasoning.length / 4);
+                const completedAt = Math.floor(Date.now() / 1000);
                 const response = {
                     id: responseId,
                     object: 'response',
-                    created: Math.floor(Date.now() / 1000),
+                    created: completedAt,
+                    created_at: completedAt,
+                    status: 'completed',
                     model: `${pID}/${mID}`,
                     reasoning: safeReasoning ? { effort: reasoningLevel, summary: safeReasoning.substring(0, 100) } : undefined,
                     output: streamOutput,
+                    error: null,
+                    incomplete_details: null,
                     usage: {
                         input_tokens: promptTokens,
                         output_tokens: completionTokens + reasoningTokens,
@@ -2904,13 +2912,18 @@ export function createApp(config) {
             });
 
             const responseId = `resp_${crypto.randomUUID()}`;
+            const createdAt = Math.floor(Date.now() / 1000);
             const response = {
                 id: responseId,
                 object: 'response',
-                created: Math.floor(Date.now() / 1000),
+                created: createdAt,
+                created_at: createdAt,
+                status: 'completed',
                 model: `${pID}/${mID}`,
                 reasoning: safeReasoning ? { effort: reasoningLevel, summary: safeReasoning.substring(0, 100) } : undefined,
                 output,
+                error: null,
+                incomplete_details: null,
                 usage: {
                     input_tokens: promptTokens,
                     output_tokens: completionTokens + reasoningTokens,
@@ -2932,9 +2945,10 @@ export function createApp(config) {
             // the already-open stream instead.
             if (res.headersSent) {
                 try {
+                    const failedAt = Math.floor(Date.now() / 1000);
                     res.write(`data: ${JSON.stringify({
                         type: 'response.failed',
-                        response: { error: transformed.error.error || transformed.error }
+                        response: { id: `resp_${crypto.randomUUID()}`, object: 'response', created: failedAt, created_at: failedAt, status: 'failed', error: transformed.error.error || transformed.error }
                     })}\n\n`);
                     res.write('data: [DONE]\n\n');
                 } catch (writeError) {

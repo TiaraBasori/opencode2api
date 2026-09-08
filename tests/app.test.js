@@ -1586,15 +1586,23 @@ describe('Proxy OpenAI API', () => {
             });
 
         expect(res.statusCode).toEqual(200);
+        expect(res.body.object).toEqual('response');
+        expect(res.body.status).toEqual('completed');
+        expect(res.body.created_at).toEqual(expect.any(Number));
+        expect(res.body.created).toEqual(res.body.created_at);
+        expect(res.body.error).toBeNull();
+        expect(res.body.incomplete_details).toBeNull();
         expect(res.body.output).toEqual([
             {
+                id: expect.any(String),
                 type: 'message',
                 role: 'assistant',
                 status: 'completed',
                 content: [
                     {
                         type: 'output_text',
-                        text: 'Fetched via internal allowlist tools'
+                        text: 'Fetched via internal allowlist tools',
+                        annotations: []
                     }
                 ]
             }
@@ -1808,15 +1816,22 @@ describe('Proxy OpenAI API', () => {
 
         expect(res.statusCode).toEqual(200);
         expect(res.body.object).toEqual('response');
+        expect(res.body.status).toEqual('completed');
+        expect(res.body.created_at).toEqual(expect.any(Number));
+        expect(res.body.created).toEqual(res.body.created_at);
+        expect(res.body.error).toBeNull();
+        expect(res.body.incomplete_details).toBeNull();
         expect(res.body.output).toEqual([
             {
+                id: expect.any(String),
                 type: 'message',
                 role: 'assistant',
                 status: 'completed',
                 content: [
                     {
                         type: 'output_text',
-                        text: 'The weather in Tokyo is 22°C and sunny.'
+                        text: 'The weather in Tokyo is 22°C and sunny.',
+                        annotations: []
                     }
                 ]
             }
