@@ -2154,6 +2154,12 @@ export function createApp(config) {
                         let reasoning = '';
                         let error = null;
                         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                            // The route watchdog may have already answered (502) and deleted
+                            // the session; stop feeding the backend once the client is gone.
+                            if (res.writableEnded || res.destroyed) {
+                                logDebug('Client gone, stop retrying', { sessionId, attempt });
+                                return;
+                            }
                             if (attempt > 1) {
                                 // Retry on a fresh session: the failed attempt left an errored
                                 // assistant message in the old one, and re-prompting the same
@@ -2203,6 +2209,10 @@ export function createApp(config) {
                             break;
                         }
                         if (error && !content && !reasoning) {
+                            // Prompt/poll timeout throws must propagate to the route catch
+                            // so transformUpstreamError maps them to 504/timeout, exactly
+                            // like the pre-try/catch behavior.
+                            if (/^Request timeout after/.test(error.message || '')) throw error;
                             return res.status(502).json({
                                 error: {
                                     message: error.data?.message || error.message || 'OpenCode provider error',
@@ -2996,6 +3006,11 @@ export function createApp(config) {
             let polledFilled = false;
             let lastResponsesAttemptError = null;
             for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                // Stop once the client is gone (route watchdog may have answered already).
+                if (res.writableEnded || res.destroyed) {
+                    logDebug('Client gone, stop retrying', { sessionId, attempt });
+                    return;
+                }
                 if (attempt > 1) {
                     // Same fresh-session rotation as chat: the failed attempt left an
                     // errored assistant message behind, and re-prompting it would
@@ -3311,10 +3326,16 @@ export function createApp(config) {
                         let reasoning = '';
                         let error = null;
                         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                            // Stop once the client is gone (route watchdog may have answered already).
+                            if (res.writableEnded || res.destroyed) {
+                                logDebug('Client gone, stop retrying', { sessionId, attempt });
+                                return;
+                            }
                             if (attempt > 1) {
                                 try { await client.session.delete({ path: { id: sessionId } }); } catch {}
                                 const r = await client.session.create();
                                 sessionId = r.data?.id;
+                                if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
                                 promptParams.path.id = sessionId;
                                 requestForcedMessagesToolCall = makeForcedMessagesToolCallRequester();
                                 await sleep(computeRetryDelay(attempt - 1, error));
