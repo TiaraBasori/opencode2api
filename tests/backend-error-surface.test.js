@@ -8,7 +8,11 @@ import { jest } from '@jest/globals';
 
 const BACKEND_CREDITS_ERROR = {
     name: 'CreditsError',
-    data: { message: '401: {"message":"Insufficient balance, please recharge","type":"CreditsError"}' }
+    data: {
+        message: '401: {"message":"Insufficient balance, please recharge","type":"CreditsError"}',
+        // Fast retry hint so the suite never waits out real backoff delays.
+        responseHeaders: { 'retry-after-ms': '10' }
+    }
 };
 
 const sdkMocks = {
@@ -113,5 +117,149 @@ describe('POST /v1/responses backend plain-object error', () => {
         expect(res.body.error?.type).toBe('insufficient_quota');
         expect(JSON.stringify(res.body)).toContain('Insufficient balance');
         expect(JSON.stringify(res.body)).not.toContain('"Object"');
+    });
+
+    test('responses non-stream retries transient failure then succeeds', async () => {
+        sdkMocks.sessionMessages
+            .mockResolvedValueOnce([
+                { info: { role: 'assistant', finish: 'stop', error: BACKEND_CREDITS_ERROR }, parts: [] }
+            ])
+            .mockResolvedValue([
+                { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'recovered' }] }
+            ]);
+        const res = await request(app).post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/kimi-k2.5', input: 'hi' });
+        expect(res.statusCode).toBe(200);
+        expect(JSON.stringify(res.body)).toContain('recovered');
+        expect(sdkMocks.sessionCreate.mock.calls.length).toBe(2);
+    });
+
+    describe('RETRY_MAX_RETRIES wiring (chat non-stream)', () => {
+        const fastTransientError = {
+            name: 'CreditsError',
+            data: {
+                message: '429: {"message":"Too many requests","type":"CreditsError"}',
+                responseHeaders: { 'retry-after-ms': '10' }
+            }
+        };
+        const buildApp = (retries) => createApp({
+            PORT: 10000, API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000, DISABLE_TOOLS: true, DEBUG: false,
+            RETRY_MAX_RETRIES: retries
+        }).app;
+
+        test('default retries transient errors (1 initial + retries)', async () => {
+            sdkMocks.sessionMessages.mockImplementation(async () => ([
+                { info: { role: 'assistant', finish: 'stop', error: fastTransientError }, parts: [] }
+            ]));
+            const chatApp = buildApp(undefined);
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+            // Chat surfaces backend failures as 502 with the real message (existing behavior).
+            expect(res.statusCode).toBe(502);
+            expect(JSON.stringify(res.body)).toContain('Too many requests');
+            // 1 initial session + 3 retries on fresh sessions (deterministic mock)
+            expect(sdkMocks.sessionCreate.mock.calls.length).toBe(4);
+        });
+
+        test('RETRY_MAX_RETRIES=0 disables retry (single attempt)', async () => {
+            sdkMocks.sessionMessages.mockImplementation(async () => ([
+                { info: { role: 'assistant', finish: 'stop', error: fastTransientError }, parts: [] }
+            ]));
+            const chatApp = buildApp(0);
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+            expect(res.statusCode).toBe(502);
+            expect(sdkMocks.sessionCreate.mock.calls.length).toBe(1);
+        });
+
+        test('RETRY_MAX_RETRIES clamps to upstream ceiling of 5', async () => {
+            sdkMocks.sessionMessages.mockImplementation(async () => ([
+                { info: { role: 'assistant', finish: 'stop', error: fastTransientError }, parts: [] }
+            ]));
+            const chatApp = buildApp(99);
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+            expect(res.statusCode).toBe(502);
+            // 1 initial + exactly 5 retries after clamping 99 -> 5
+            expect(sdkMocks.sessionCreate.mock.calls.length).toBe(6);
+        });
+    });
+
+    describe('prompt-layer throw + genuine auth (chat non-stream)', () => {
+        const buildApp = (retries) => createApp({
+            PORT: 10000, API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000, DISABLE_TOOLS: true, DEBUG: false,
+            RETRY_MAX_RETRIES: retries
+        }).app;
+
+        test('prompt throw with transient signature retries then succeeds', async () => {
+            const throwErr = new Error('fetch failed: socket hang up');
+            throwErr.responseHeaders = { 'retry-after-ms': '10' };
+            sdkMocks.sessionPrompt
+                .mockRejectedValueOnce(throwErr)
+                .mockResolvedValue({ data: { parts: [] } });
+            sdkMocks.sessionMessages.mockImplementation(async () => ([
+                { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'recovered-prompt' }] }
+            ]));
+            const chatApp = buildApp(undefined);
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+            expect(res.statusCode).toBe(200);
+            expect(JSON.stringify(res.body)).toContain('recovered-prompt');
+            expect(sdkMocks.sessionCreate.mock.calls.length).toBe(2);
+        });
+
+        test('genuine auth failure surfaces immediately without retry', async () => {
+            sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
+            sdkMocks.sessionMessages.mockImplementation(async () => ([
+                { info: { role: 'assistant', finish: 'stop', error: { name: 'ProviderAuthError', data: { message: 'Invalid API key for provider' } } }, parts: [] }
+            ]));
+            const chatApp = buildApp(undefined);
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+            expect(res.statusCode).toBe(502);
+            expect(JSON.stringify(res.body)).toContain('Invalid API key');
+            expect(sdkMocks.sessionCreate.mock.calls.length).toBe(1);
+        });
+
+        test('genuine auth failure with 401 status still skips retry', async () => {
+            sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
+            sdkMocks.sessionMessages.mockImplementation(async () => ([
+                { info: { role: 'assistant', finish: 'stop', error: { name: 'ProviderAuthError', data: { message: '401: Invalid API key', status: 401 } } }, parts: [] }
+            ]));
+            const chatApp = buildApp(undefined);
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+            // Without the early-false, status 401 alone would trigger retries.
+            expect(res.statusCode).toBe(502);
+            expect(sdkMocks.sessionCreate.mock.calls.length).toBe(1);
+        });
+
+        test.each([
+            ['Authentication error', '401: Authentication error'],
+            ['expired key', 'API key expired'],
+            ['underscore code', 'invalid_api_key']
+        ])('auth variant skips retry: %s', async (_label, msg) => {
+            sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
+            sdkMocks.sessionMessages.mockImplementation(async () => ([
+                { info: { role: 'assistant', finish: 'stop', error: { name: 'ProviderAuthError', data: { message: msg } } }, parts: [] }
+            ]));
+            const chatApp = buildApp(undefined);
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+            expect(res.statusCode).toBe(502);
+            expect(sdkMocks.sessionCreate.mock.calls.length).toBe(1);
+        });
     });
 });
