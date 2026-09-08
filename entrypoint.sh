@@ -45,7 +45,14 @@ if [[ "$1" == "opencode" && "$2" == "serve" ]]; then
     SERVER_PID=$!
     
     echo "Waiting for OpenCode Server to become available..."
-    MAX_RETRIES=30
+    # Cold start on small (1GB) hosts can take minutes; do not kill early.
+    # Budget: 90 x 2s sleep ~= 180s when the backend refuses fast (normal
+    # cold start; covered by compose start_period 200s). If the backend
+    # accepts but hangs every probe, each round costs up to curl -m 5 + 2s
+    # sleep (worst case ~630s) — that means the backend itself is wedged,
+    # not slow, and the container will exit 1 so it can be rescheduled.
+    MAX_RETRIES=90
+    RETRY_DELAY=2
     COUNT=0
     while ! curl -s -m 5 http://127.0.0.1:${SERVER_PORT}/health > /dev/null; do
         if [ $COUNT -ge $MAX_RETRIES ]; then
@@ -53,13 +60,13 @@ if [[ "$1" == "opencode" && "$2" == "serve" ]]; then
             kill $SERVER_PID 2>/dev/null
             exit 1
         fi
-        
+
         if ! kill -0 $SERVER_PID 2>/dev/null; then
             echo "OpenCode Server process died unexpectedly."
             exit 1
         fi
-        
-        sleep 1
+
+        sleep $RETRY_DELAY
         COUNT=$((COUNT+1))
     done
     echo "OpenCode Server is up!"

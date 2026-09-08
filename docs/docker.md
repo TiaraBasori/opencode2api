@@ -1,7 +1,7 @@
 # 🐳 Docker 部署
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.5.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.6.0-blue" alt="Version">
 </p>
 
 ---
@@ -83,7 +83,6 @@ docker build -t my-opencode2api .
 ```bash
 docker run -d \
   -p 10000:10000 \
-  -p 10001:10001 \
   -e API_KEY=your-key \
   -e OPENCODE_SERVER_PASSWORD=your-password \
   -v opencode-data:/home/node/.local/share/opencode \
@@ -91,43 +90,35 @@ docker run -d \
   my-opencode2api
 ```
 
----
+> 后端 `10001` 仅容器内部使用，不要对外发布（compose 默认也只映射代理端口；改端口用 `OPENCODE_PROXY_PORT`，如 `8090`）。
 
-## 📝 生产部署建议
+### 多架构
 
-### 移除源码挂载
+`ghcr.io/samson910022/opencode2api:latest` 同时含 `linux/amd64` 与 `linux/arm64`，ARM 机器可直接 pull，无需本地 build（仅自带 `custom-bin/opencode` 二进制时才需按架构重建）。
 
-如果不需要在容器内修改代码，可以移除项目目录的挂载:
+### 覆寫資源限制
+
+compose 預設 `mem_limit 768m`（單容器含 proxy＋後端）。大機要放寬或取消，用 override 檔：
 
 ```yaml
-# docker-compose.yml
-volumes:
-  - opencode-data:/home/node/.local/share/opencode
-  - opencode-config:/home/node/.config/opencode
-  # 移除这一行
-  # - .:/home/node/project
+# docker-compose.override.yml
+services:
+  opencode2api:
+    mem_limit: 2g
+    mem_reservation: 512m
+    cpus: 4.0
 ```
 
 ---
 
 ## 📊 日志管理
 
+compose 已内置 json-file 轮转（`max-size: 10m`、`max-file: 3`）；裸 `docker run` 请自行加上 `--log-opt max-size=10m --log-opt max-file=3`。
+
 ### 查看日志
 
 ```bash
 docker compose logs -f
-```
-
-### 日志轮转
-
-推荐使用 Docker 的日志驱动配置:
-
-```yaml
-logging:
-  driver: "json-file"
-  options:
-    max-size: "10m"
-    max-file: "3"
 ```
 
 ---
@@ -138,12 +129,14 @@ logging:
 
 ```yaml
 healthcheck:
-  test: ["CMD", "curl", "-f", "http://localhost:10000/health"]
+  test: ["CMD", "curl", "-f", "http://localhost:${OPENCODE_PROXY_PORT:-10000}/health"]
   interval: 30s
   timeout: 10s
   retries: 3
-  start_period: 60s
+  start_period: 200s
 ```
+
+> `/health` 是浅检查（只确认代理活着，不测后端；`start_period` 200s 覆盖 entrypoint 约 180s 的小机冷启动等待）。小机（1GB）另有 `mem_limit 768m` / `pids_limit 256` 保护，裸 `docker run` 请加等价旗（见 `docker-compose.yml` 注释）。
 
 ---
 

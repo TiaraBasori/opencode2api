@@ -1,7 +1,7 @@
 # ⚙️ 配置详解
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.5.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.6.0-blue" alt="Version">
 </p>
 
 ---
@@ -21,7 +21,7 @@
 | `PORT` / `OPENCODE_PROXY_PORT` | `10000` | 代理服务端口 |
 | `OPENCODE_SERVER_PORT` | `10001` | OpenCode 后端服务端口 |
 | `API_KEY` | - | Bearer Token 认证密钥 |
-| `BIND_HOST` | `0.0.0.0` | 绑定地址 |
+| `BIND_HOST` | `0.0.0.0` | 绑定地址（`BIND_HOST` 优先，`OPENCODE_PROXY_BIND_HOST` 为后备） |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode 后端地址 |
 | `OPENCODE_SERVER_PASSWORD` | - | OpenCode 后端密码 |
 
@@ -29,7 +29,7 @@
 
 | 变量 | 默认值 | 说明 |
 |:-----|:-------|:-----|
-| `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用 |
+| `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用（兼容别名；`OPENCODE_DISABLE_TOOLS` 优先，二者无效值都会让位给下一顺位：canonical env > legacy env > `config.json` > 默认） |
 | `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
 | `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具冲突隔离策略；当前仅支持 `namespace` |
 | `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `false` | 兼容旧开关；未显式配置 allowlist 时，启用后默认放行 `web_fetch` |
