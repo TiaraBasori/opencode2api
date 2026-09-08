@@ -65,8 +65,8 @@ docs: update configuration documentation
 
 ```bash
 # Clone and install
-git clone https://github.com/TiaraBasori/opencode2api.git
-cd opencode2api
+git clone https://github.com/samson910022/OpenCode2API.git
+cd OpenCode2API
 npm install
 
 # Run tests

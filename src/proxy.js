@@ -10,6 +10,19 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { buildExternalToolRegistry, findExternalToolByName } from './tool-runtime/registry.js';
+import { EXTERNAL_TOOL_PREFIX } from './tool-runtime/contracts.js';
+import {
+    validateMessagesRequest,
+    extractSystemText,
+    anthropicMessagesToChatMessages,
+    anthropicToolsToChatTools,
+    anthropicToolChoiceToChat,
+    anthropicThinkingToReasoningEffort,
+    mapFinishToStopReason,
+    buildAnthropicMessage,
+    sseEvent,
+    estimateTokens
+} from './converters/anthropic.js';
 import { buildToolExposure } from './tool-runtime/router.js';
 import { evaluateToolPolicy } from './tool-runtime/policy.js';
 import { validateToolCalls } from './tool-runtime/validator.js';
@@ -530,7 +543,7 @@ export function createApp(config) {
     app.use(cors({
         origin: '*',
         methods: ['GET', 'POST', 'OPTIONS'],
-        allowedHeaders: ['Content-Type', 'Authorization']
+        allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'anthropic-version']
     }));
     app.use(bodyParser.json({ limit: '50mb' }));
     app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
@@ -548,12 +561,16 @@ export function createApp(config) {
         return false;
     };
 
-    // Auth middleware
+    // Auth middleware (accepts Authorization: Bearer and x-api-key for Anthropic SDK compat)
     app.use((req, res, next) => {
         if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics') return next();
         if (API_KEY && API_KEY.trim() !== '') {
             const authHeader = req.headers.authorization;
-            if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+            const apiKeyHeader = req.headers['x-api-key'];
+            if (!((authHeader && authHeader === `Bearer ${API_KEY}`) || (apiKeyHeader && apiKeyHeader === API_KEY))) {
+                if (req.path === '/v1/messages') {
+                    return res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Unauthorized' } });
+                }
                 return res.status(401).json({ error: { message: 'Unauthorized' } });
             }
         }
@@ -782,8 +799,8 @@ export function createApp(config) {
     };
 
     const normalizeToolArguments = (args) => {
+        if (args === undefined || args === null || args === '') return '{}';
         if (typeof args === 'string') return args;
-        if (args === undefined) return '{}';
         try {
             return JSON.stringify(args);
         } catch (e) {
@@ -813,7 +830,8 @@ export function createApp(config) {
             registry,
             exposure,
             toolChoice: exposure.toolChoice,
-            prompt: exposure.prompt
+            prompt: exposure.prompt,
+            reminder: exposure.reminder
         };
     };
 
@@ -854,9 +872,10 @@ export function createApp(config) {
             ? createExternalToolContext(tools, toolChoice)
             : {
                 registry: [],
-                exposure: { tools: [], toolChoice: { mode: 'auto', requiredTool: null }, prompt: '' },
+                exposure: { tools: [], toolChoice: { mode: 'auto', requiredTool: null }, prompt: '', reminder: '' },
                 toolChoice: { mode: 'auto', requiredTool: null },
-                prompt: ''
+                prompt: '',
+                reminder: ''
             };
 
         return {
@@ -2172,7 +2191,8 @@ export function createApp(config) {
     const hasValidBearerAuth = (req) => {
         if (!API_KEY || API_KEY.trim() === '') return true;
         const authHeader = req.headers.authorization;
-        return Boolean(authHeader && authHeader === `Bearer ${API_KEY}`);
+        const apiKeyHeader = req.headers['x-api-key'];
+        return Boolean((authHeader && authHeader === `Bearer ${API_KEY}`) || (apiKeyHeader && apiKeyHeader === API_KEY));
     };
 
     const shouldAllowOperationalEndpoint = (req, { enabled, requireAuth }) => {
@@ -2957,6 +2977,353 @@ export function createApp(config) {
                 return res.end();
             }
             return res.status(transformed.statusCode).json(transformed.error);
+        }
+    });
+
+    // Anthropic Messages API (P0: non-stream + stream via shared opencode backend)
+    app.post('/v1/messages', async (req, res) => {
+        try {
+            await lock(async () => {
+                let sessionId = null;
+                let keepaliveInterval = null;
+                try {
+                    const validationError = validateMessagesRequest(req.body);
+                    if (validationError) {
+                        return res.status(validationError.statusCode).json(validationError.body);
+                    }
+                    const {
+                        model, system, messages, tools = [], tool_choice,
+                        stream: requestStream, temperature, top_p, top_k,
+                        max_tokens, stop_sequences, thinking
+                    } = req.body;
+                    const stream = Boolean(requestStream);
+                    const chatMessages = anthropicMessagesToChatMessages(messages);
+                    const systemText = extractSystemText(system);
+                    if (systemText) chatMessages.unshift({ role: 'system', content: systemText });
+                    const chatTools = anthropicToolsToChatTools(tools);
+                    const chatToolChoice = anthropicToolChoiceToChat(tool_choice);
+                    const reasoningLevel = anthropicThinkingToReasoningEffort(thinking)
+                        || normalizeReasoningEffort(undefined, null);
+
+                    const requestParams = {
+                        temperature: typeof temperature === 'number' ? temperature : 0.7,
+                        max_tokens: typeof max_tokens === 'number' ? max_tokens : null,
+                        top_p: typeof top_p === 'number' ? top_p : 1.0,
+                        stop: Array.isArray(stop_sequences) ? stop_sequences : null,
+                        reasoning_effort: reasoningLevel
+                    };
+                    if (top_k !== undefined) logDebug('Ignoring top_k (no opencode equivalent)', { top_k });
+
+                    const resolvedModel = await resolveRequestedModel(model);
+                    const pID = resolvedModel.providerID;
+                    const mID = resolvedModel.modelID;
+                    const publicModel = `${pID}/${mID}`;
+
+                    const requestToolContext = createRequestToolContext(chatTools, chatToolChoice, undefined);
+                    const toolMode = requestToolContext.mode;
+                    const externalToolContext = requestToolContext.external;
+                    const externalToolRegistry = externalToolContext.registry;
+                    const externalToolChoice = externalToolContext.toolChoice;
+                    const internalToolContext = requestToolContext.internal;
+                    trackToolMode(toolMode, { route: '/v1/messages' });
+
+                    // Reuse chat-style prompt flattening for the converted messages.
+                    const parts = [];
+                    const systemChunks = [];
+                    const assistantToolCalls = new Map();
+                    const formatRoleLine = (role, name, text) => `${String(role).toUpperCase()}${name ? `(${name})` : ''}: ${text}`;
+                    for (const m of chatMessages) {
+                        const role = (m?.role || 'user').toLowerCase();
+                        const content = m?.content;
+                        if (role === 'system') {
+                            const text = normalizeTextContent(content);
+                            if (text) systemChunks.push(text);
+                            continue;
+                        }
+                        if (role === 'assistant' && Array.isArray(m?.tool_calls) && m.tool_calls.length) {
+                            const serialized = m.tool_calls.map((tc, i) => ({
+                                id: tc?.id || `toolu_${i + 1}`,
+                                name: findExternalToolByName(externalToolRegistry, tc?.function?.name || tc?.name)?.namespacedName || tc?.function?.name || tc?.name,
+                                arguments: normalizeToolArguments(tc?.function?.arguments ?? tc?.arguments)
+                            })).filter((tc) => tc.name);
+                            serialized.forEach((tc) => assistantToolCalls.set(tc.id, tc.name));
+                            if (serialized.length) parts.push({ type: 'text', text: `ASSISTANT: <function_calls>${JSON.stringify(serialized)}</function_calls>` });
+                        }
+                        if (role === 'tool') {
+                            const text = normalizeTextContent(content);
+                            if (text) {
+                                const mapped = findExternalToolByName(externalToolRegistry, m?.name)
+                                    || findExternalToolByName(externalToolRegistry, assistantToolCalls.get(m?.tool_call_id));
+                                const toolName = mapped?.namespacedName || assistantToolCalls.get(m?.tool_call_id) || m?.name || `${EXTERNAL_TOOL_PREFIX}unknown`;
+                                parts.push({ type: 'text', text: `TOOL_RESULT: ${JSON.stringify({ tool_call_id: m?.tool_call_id || toolName, name: toolName, content: text })}` });
+                            }
+                            continue;
+                        }
+                        if (!content) continue;
+                        if (typeof content === 'string') {
+                            parts.push({ type: 'text', text: formatRoleLine(role, m?.name, content) });
+                        } else if (Array.isArray(content)) {
+                            for (const part of content) {
+                                if (!part) continue;
+                                if (part.type === 'text') parts.push({ type: 'text', text: formatRoleLine(role, m?.name, part.text || '') });
+                                else if (part.type === 'image_url') {
+                                    const imageUrl = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+                                    if (imageUrl) {
+                                        try {
+                                            const dataUri = await getImageDataUri(imageUrl);
+                                            parts.push({ type: 'file', mime: dataUri.split(';')[0].split(':')[1], url: dataUri, filename: 'image' });
+                                        } catch (e) { logDebug('Skipping image', { error: e.message }); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (!parts.length) return res.status(400).json({ type: 'error', error: { type: 'invalid_request_error', message: 'messages must include at least one text message' } });
+
+                    const systemWithGuard = buildSystemPrompt(
+                        [systemChunks.join('\n\n'), externalToolContext.prompt].filter(Boolean).join('\n\n'),
+                        requestParams.reasoning_effort, toolMode, internalToolContext.allowedToolNames
+                    );
+                    await ensureBackend(config);
+                    try {
+                        await client.config.update({ body: { activeModel: { providerID: pID, modelID: mID } } });
+                    } catch (e) { logDebug('Failed to set active model', { error: e.message }); }
+                    const sessionRes = await client.session.create();
+                    sessionId = sessionRes.data?.id;
+                    if (!sessionId) throw new Error('Failed to create OpenCode session');
+
+                    const promptParams = {
+                        path: { id: sessionId },
+                        body: {
+                            model: { providerID: pID, modelID: mID },
+                            system: systemWithGuard,
+                            parts: externalToolContext.reminder ? [...parts, { type: 'text', text: externalToolContext.reminder }] : parts,
+                            ...(requestParams.max_tokens && { max_tokens: requestParams.max_tokens }),
+                            ...(requestParams.temperature !== undefined && { temperature: requestParams.temperature }),
+                            ...(requestParams.top_p !== undefined && { top_p: requestParams.top_p }),
+                            ...(requestParams.stop && { stop: requestParams.stop })
+                        }
+                    };
+                    const toolOverrides = await getToolOverridesForMode(toolMode, internalToolContext);
+                    if (toolOverrides && Object.keys(toolOverrides).length > 0) promptParams.body.tools = toolOverrides;
+
+                    const fullPromptText = parts.map((p) => p.text || '').join('\n\n');
+                    const messageId = `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
+                    const inputTokens = estimateTokens(fullPromptText + (systemWithGuard || ''));
+
+                    const makeForcedMessagesToolCallRequester = () => createForcedToolCallRequester({
+                        mode: externalToolChoice.mode,
+                        sessionId,
+                        systemWithGuard,
+                        requiredTool: externalToolChoice.requiredTool || externalToolRegistry[0]?.namespacedName,
+                        providerID: pID,
+                        modelID: mID,
+                        toolOverrides,
+                        requestTimeoutMs: REQUEST_TIMEOUT_MS,
+                        forbidThinkBlock: true
+                    });
+                    let requestForcedMessagesToolCall = makeForcedMessagesToolCallRequester();
+
+                    const finalizeAnthropic = (content, reasoning, validatedToolCalls) => {
+                        const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
+                        const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
+                        const publicCalls = toPublicToolCalls(validatedToolCalls);
+                        // Map public tool calls back to Anthropic tool_use (preserve toolu_ ids from history when possible).
+                        const anthropicTools = publicCalls.map((tc) => {
+                            let input = {};
+                            try { input = JSON.parse(tc.function.arguments || '{}'); } catch { input = {}; }
+                            return { id: tc.id, function: { name: tc.function.name, arguments: tc.function.arguments }, _input: input };
+                        });
+                        // Token counts are estimates (chars/4); the backend does not surface
+                        // real usage or a truncation signal, so stop_reason is derived from
+                        // tool calls only and never inferred from max_tokens.
+                        const outputTokens = estimateTokens(safeContent + safeReasoning + JSON.stringify(anthropicTools));
+                        const stopReason = mapFinishToStopReason('stop', anthropicTools.length > 0);
+                        return buildAnthropicMessage({
+                            messageId, model: publicModel, text: safeContent || '',
+                            reasoning: safeReasoning || '', toolCalls: anthropicTools,
+                            stopReason, inputTokens, outputTokens
+                        });
+                    };
+
+                    if (!stream) {
+                        let content = '';
+                        let reasoning = '';
+                        let error = null;
+                        for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
+                            if (attempt > 1) {
+                                try { await client.session.delete({ path: { id: sessionId } }); } catch {}
+                                const r = await client.session.create();
+                                sessionId = r.data?.id;
+                                promptParams.path.id = sessionId;
+                                requestForcedMessagesToolCall = makeForcedMessagesToolCallRequester();
+                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                            }
+                            await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                            const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            content = collected.content || '';
+                            reasoning = collected.reasoning || '';
+                            error = collected.error || null;
+                            if (error && !content && !reasoning && attempt < RETRY_MAX_ATTEMPTS && isTransientUpstreamError(error)) continue;
+                            break;
+                        }
+                        if (error && !content && !reasoning) {
+                            const t = transformUpstreamError(error);
+                            return res.status(502).json({ type: 'error', error: { type: 'api_error', message: t.error?.error?.message || t.error?.message || 'Upstream error' } });
+                        }
+                        let parsed = externalToolRegistry.length > 0 ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content) : [];
+                        if (parsed.length === 0 && externalToolChoice.mode === 'required') {
+                            const forcedResponse = await requestForcedMessagesToolCall();
+                            if (forcedResponse) {
+                                content = forcedResponse.content || content;
+                                reasoning = forcedResponse.reasoning || reasoning;
+                                parsed = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
+                            }
+                        }
+                        const { validCalls } = finalizeValidatedToolCalls(parsed, externalToolRegistry);
+                        return res.json(finalizeAnthropic(content, reasoning, validCalls));
+                    }
+
+                    // Stream: Anthropic SSE (message_start/content_block_*/message_delta/message_stop, no [DONE])
+                    res.setHeader('Content-Type', 'text/event-stream');
+                    res.setHeader('Cache-Control', 'no-cache');
+                    res.setHeader('Connection', 'keep-alive');
+                    keepaliveInterval = setInterval(() => { if (!res.destroyed) res.write(': keep-alive\n\n'); }, 15000);
+                    const reqClosed = new Promise((resolve) => req.on('close', () => resolve(true)));
+                    let streamedText = '';
+                    let streamedReasoning = '';
+                    let rawContent = '';
+                    let rawReasoning = '';
+                    const streamedToolCalls = [];
+                    const filterContent = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: externalToolRegistry.length > 0 });
+                    const filterReasoning = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: externalToolRegistry.length > 0 });
+                    const parseContent = createExternalToolCallStreamParser(externalToolRegistry);
+                    const parseReason = createExternalToolCallStreamParser(externalToolRegistry);
+                    let textBlockOpen = false;
+                    let thinkingBlockOpen = false;
+                    let nextBlockIndex = 0;
+                    let textIndex = null;
+                    let thinkingIndex = null;
+                    const ensureTextIndex = () => {
+                        if (textIndex === null) textIndex = nextBlockIndex++;
+                        return textIndex;
+                    };
+                    const ensureThinkingIndex = () => {
+                        if (thinkingIndex === null) thinkingIndex = nextBlockIndex++;
+                        return thinkingIndex;
+                    };
+                    res.write(sseEvent('message_start', { type: 'message_start', message: { id: messageId, type: 'message', role: 'assistant', model: publicModel, content: [], stop_reason: null, usage: { input_tokens: inputTokens, output_tokens: 0 } } }));
+                    const sendTextDelta = (delta) => {
+                        if (!delta) return;
+                        const idx = ensureTextIndex();
+                        if (!textBlockOpen) {
+                            res.write(sseEvent('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'text', text: '' } }));
+                            textBlockOpen = true;
+                        }
+                        streamedText += delta;
+                        res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: delta } }));
+                    };
+                    const sendReasoningDelta = (delta) => {
+                        if (!delta) return;
+                        const idx = ensureThinkingIndex();
+                        if (!thinkingBlockOpen) {
+                            res.write(sseEvent('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'thinking', thinking: '', signature: '' } }));
+                            thinkingBlockOpen = true;
+                        }
+                        streamedReasoning += delta;
+                        res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'thinking_delta', thinking: delta } }));
+                    };
+                    const sendDelta = (delta, isReasoning = false) => {
+                        if (!delta) return;
+                        if (isReasoning) rawReasoning += delta; else rawContent += delta;
+                        const parsedCalls = isReasoning ? parseReason(delta) : parseContent(delta);
+                        parsedCalls.forEach((tc) => streamedToolCalls.push(tc));
+                        const filtered = isReasoning ? filterReasoning(delta) : filterContent(delta);
+                        if (!filtered) return;
+                        if (isReasoning) sendReasoningDelta(filtered);
+                        else sendTextDelta(filtered);
+                    };
+                    let collected = null;
+                    const collectPromise = collectFromEvents(sessionId, REQUEST_TIMEOUT_MS, sendDelta, DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS, DEFAULT_EVENT_IDLE_TIMEOUT_MS)
+                        .catch((err) => ({ __error: err }));
+                    client.session.prompt(promptParams).catch((err) => logDebug('Prompt error:', err.message));
+                    collected = await Promise.race([collectPromise, reqClosed.then(() => ({ __cancelled: true }))]);
+                    if (collected?.__cancelled) {
+                        if (keepaliveInterval) clearInterval(keepaliveInterval);
+                        try { if (sessionId) await client.session.delete({ path: { id: sessionId } }); } catch (e) { logDebug('Failed to cleanup cancelled messages session', { error: e.message }); }
+                        try { if (!res.destroyed) res.end(); } catch {}
+                        return;
+                    }
+                    if (collected?.__error) {
+                        const { content, reasoning } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                        if (content && !rawContent) sendTextDelta(stripFunctionCallMarkup(content));
+                        if (reasoning && !rawReasoning) sendReasoningDelta(stripFunctionCallMarkup(reasoning));
+                    }
+                    if (textBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
+                    if (thinkingBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: thinkingIndex }));
+                    // Flush held buffers before final parse (mirrors /v1/chat/completions).
+                    const flushedReasoningCalls = parseReason.flush ? parseReason.flush() : [];
+                    const flushedContentCalls = parseContent.flush ? parseContent.flush() : [];
+                    const flushedReasoningText = filterReasoning.flush ? filterReasoning.flush() : '';
+                    const flushedContentText = filterContent.flush ? filterContent.flush() : '';
+                    const finalReasoningText = rawReasoning + flushedReasoningText;
+                    const finalContentText = rawContent + flushedContentText;
+                    const parseStreamedToolCalls = () => {
+                        if (externalToolRegistry.length === 0) return [];
+                        const perChannel = [
+                            ...flushedReasoningCalls,
+                            ...flushedContentCalls,
+                            ...parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText, finalContentText)
+                        ];
+                        if (perChannel.length > 0) return perChannel;
+                        return parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText + finalContentText);
+                    };
+                    // Exclusive: incremental hits already describe the same markup that a
+                    // full re-parse would find again, so never combine both (else 1 call -> 2 blocks).
+                    let parsedToolCalls = streamedToolCalls.length > 0
+                        ? [...streamedToolCalls, ...flushedReasoningCalls, ...flushedContentCalls]
+                        : parseStreamedToolCalls();
+                    if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                        const forcedResponse = await requestForcedMessagesToolCall();
+                        if (forcedResponse) {
+                            parsedToolCalls = parseExternalToolCallsFromText(
+                                externalToolRegistry,
+                                forcedResponse.reasoning,
+                                forcedResponse.content
+                            );
+                        }
+                    }
+                    const { validCalls: finalValidated } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
+                    let toolBlockIndex = nextBlockIndex;
+                    for (const tc of toPublicToolCalls(finalValidated)) {
+                        res.write(sseEvent('content_block_start', { type: 'content_block_start', index: toolBlockIndex, content_block: { type: 'tool_use', id: tc.id, name: tc.function.name, input: {} } }));
+                        res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: toolBlockIndex, delta: { type: 'input_json_delta', partial_json: tc.function.arguments || '{}' } }));
+                        res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: toolBlockIndex }));
+                        toolBlockIndex += 1;
+                    }
+                    const outputTokens = estimateTokens(streamedText + streamedReasoning);
+                    const stopReason = mapFinishToStopReason('stop', finalValidated.length > 0);
+                    res.write(sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } }));
+                    res.write(sseEvent('message_stop', { type: 'message_stop' }));
+                    if (keepaliveInterval) clearInterval(keepaliveInterval);
+                    return res.end();
+                } catch (error) {
+                    if (keepaliveInterval) clearInterval(keepaliveInterval);
+                    if (sessionId) {
+                        try { await client.session.delete({ path: { id: sessionId } }); } catch (e) { logDebug('Failed to cleanup messages session on error', { error: e.message }); }
+                    }
+                    if (!res.headersSent) {
+                        const t = transformUpstreamError(error);
+                        return res.status(t.statusCode).json({ type: 'error', error: { type: 'api_error', message: t.error?.error?.message || t.error?.message || error.message } });
+                    }
+                    try {
+                        res.write(sseEvent('error', { type: 'error', error: { type: 'api_error', message: error.message } }));
+                    } catch {}
+                    return res.end();
+                }
+            }, REQUEST_TIMEOUT_MS + 20000);
+        } catch (error) {
+            if (!res.headersSent) res.status(500).json({ type: 'error', error: { type: 'api_error', message: error.message } });
         }
     });
 

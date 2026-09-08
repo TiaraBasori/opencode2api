@@ -33,10 +33,12 @@ export function normalizeToolDefinition(tool) {
   const definition = tool.function && typeof tool.function === 'object' ? tool.function : tool;
   const name = String(definition.name || '').trim();
   if (!name) return null;
+  // Anthropic Messages shape uses `input_schema` instead of `parameters`.
+  const parameters = definition.parameters ?? definition.input_schema;
   return {
     name,
     description: definition.description,
-    parameters: definition.parameters,
+    parameters,
     enabled: definition.enabled,
     x_proxy_side_effect: definition.x_proxy_side_effect ?? tool.x_proxy_side_effect,
     x_proxy_risk_level: definition.x_proxy_risk_level ?? tool.x_proxy_risk_level,

@@ -24,5 +24,5 @@
 ## 🔗 相关链接
 
 - 📄 [README](../README.md)
-- 🐙 [GitHub 仓库](https://github.com/TiaraBasori/opencode2api)
-- 🐛 [问题反馈](https://github.com/TiaraBasori/opencode2api/issues)
+- 🐙 [GitHub 仓库](https://github.com/samson910022/OpenCode2API)
+- 🐛 [问题反馈](https://github.com/samson910022/OpenCode2API/issues)

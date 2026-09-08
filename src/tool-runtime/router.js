@@ -11,6 +11,21 @@ export function normalizeExternalToolChoice(toolChoice, registry) {
   if (toolChoice === 'required') {
     return { mode: 'required', requiredTool: null };
   }
+  // Anthropic Messages shape: { type: 'auto' | 'any' | 'tool' | 'none', name? }.
+  if (typeof toolChoice?.type === 'string' && !toolChoice?.function) {
+    const t = String(toolChoice.type).toLowerCase();
+    if (t === 'auto') return { mode: 'auto', requiredTool: null };
+    if (t === 'none') return { mode: 'none', requiredTool: null };
+    if (t === 'any') return { mode: 'required', requiredTool: null };
+    if (t === 'tool' && toolChoice.name) {
+      const mappedTool = findExternalToolByName(registry, toolChoice.name);
+      return {
+        mode: 'required',
+        requiredTool: mappedTool?.namespacedName || `${EXTERNAL_TOOL_PREFIX}${toolChoice.name}`
+      };
+    }
+    if (t === 'tool') return { mode: 'required', requiredTool: null };
+  }
   // Chat Completions sends { type:'function', function:{ name } }; the Responses API sends
   // { type:'function', name }. Accept both so a forced tool choice is not silently ignored.
   const requestedName = toolChoice?.function?.name || toolChoice?.name;

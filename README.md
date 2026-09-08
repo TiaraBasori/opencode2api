@@ -17,7 +17,8 @@
 | 特性 | 说明 |
 |:-----|:-----|
 | 🟢 **OpenAI 兼容** | `/v1/models`, `/v1/chat/completions`, `/v1/responses` |
-| 📡 **流式输出** | Chat Completions 与 Responses API 的完整 SSE 流式支持 |
+| 🟣 **Anthropic 兼容** | `/v1/messages`（含 `tool_use` / `thinking` / SSE 流式） |
+| 📡 **流式输出** | Chat Completions、Responses 与 Messages API 的完整 SSE 流式支持 |
 | 🧠 **推理控制** | 支持 `reasoning_effort` 和 `reasoning: { "effort": "high" }` |
 | 🐳 **Docker 部署** | 一键部署，自动启动 OpenCode 后端 |
 | 🛡️ **工具安全** | 默认禁用工具调用 |
@@ -32,8 +33,8 @@
 
 ```bash
 # 1. 克隆并配置
-git clone https://github.com/TiaraBasori/opencode2api.git
-cd opencode2api
+git clone https://github.com/samson910022/OpenCode2API.git
+cd OpenCode2API
 cp .env.example .env
 
 # 2. 编辑 .env 设置你的配置
@@ -56,8 +57,8 @@ npm install -g opencode-ai
 # Linux/macOS: curl -fsSL https://opencode.ai/install | bash
 
 # 2. 克隆并运行
-git clone https://github.com/TiaraBasori/opencode2api.git
-cd opencode2api
+git clone https://github.com/samson910022/OpenCode2API.git
+cd OpenCode2API
 npm install
 cp config.json.example config.json
 npm start
@@ -87,7 +88,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt5-nano",
+    "model": "opencode/muse-spark-1.3-contributor-free",
     "input": "用一句话打招呼",
     "reasoning": {"effort": "high"},
     "stream": true
@@ -129,7 +130,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "opencode/big-pickle",
+    "model": "opencode/muse-spark-1.3-contributor-free",
     "input": "查询东京天气",
     "stream": true,
     "tools": [
@@ -151,6 +152,23 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
     ]
   }'
 ```
+
+### Messages API (Anthropic 兼容)
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/messages \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/muse-spark-1.3-contributor-free",
+    "max_tokens": 1024,
+    "system": "You are a helpful assistant.",
+    "messages": [{"role": "user", "content": "用一句话打招呼"}]
+  }'
+```
+
+> 也可用 `x-api-key: YOUR_API_KEY` 代替 `Authorization: Bearer`；`max_tokens` 必填；流式时返回 `message_start/content_block_start/content_block_delta/content_block_stop/message_delta/message_stop`（无 `[DONE]`）。
 
 ---
 
@@ -258,6 +276,7 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | `GET` | `/v1/models` | 获取可用模型列表 |
 | `POST` | `/v1/chat/completions` | Chat Completions API |
 | `POST` | `/v1/responses` | Responses API |
+| `POST` | `/v1/messages` | Anthropic Messages API（`max_tokens` 必填，支持 `x-api-key`） |
 
 ### 模型名称格式
 
@@ -306,9 +325,20 @@ MIT · 详见 [LICENSE](./LICENSE.md)
 
 ---
 
-## 🙏 致谢
+## 🙏 致谢 / Acknowledgments
 
-感谢以下开源项目:
+本项目由 [samson910022/OpenCode2API](https://github.com/samson910022/OpenCode2API) 独立维护，复刻（Fork）自
+[TiaraBasori/opencode2api](https://github.com/TiaraBasori/opencode2api)：
 
-- [dxxzst/opencode-to-openai](https://github.com/dxxzst/opencode-to-openai)
-- [lucasliet/opencode-openai-proxy](https://github.com/lucasliet/opencode-openai-proxy)
+- [TiaraBasori/opencode2api](https://github.com/TiaraBasori/opencode2api) — 直接上游，本项目的起点（MIT）
+
+另受以下开源项目启发：
+
+- [dxxzst/opencode-to-openai](https://github.com/dxxzst/opencode-to-openai) — 早期设计参考（MIT）
+- [lucasliet/opencode-openai-proxy](https://github.com/lucasliet/opencode-openai-proxy) — 早期设计参考（MIT）
+
+This project is independently maintained at [samson910022/OpenCode2API](https://github.com/samson910022/OpenCode2API),
+forked from [TiaraBasori/opencode2api](https://github.com/TiaraBasori/opencode2api) and inspired by
+[dxxzst/opencode-to-openai](https://github.com/dxxzst/opencode-to-openai) and
+[lucasliet/opencode-openai-proxy](https://github.com/lucasliet/opencode-openai-proxy).
+Upstream code remains under its original MIT license; see [LICENSE](./LICENSE.md).

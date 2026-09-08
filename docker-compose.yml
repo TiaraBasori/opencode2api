@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.io/tiarabasori/opencode2api:latest
+    image: ghcr.io/samson910022/opencode2api:latest
     container_name: opencode2api
     ports:
       - "${OPENCODE_PROXY_PORT:-10000}:${OPENCODE_PROXY_PORT:-10000}"

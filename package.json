@@ -20,13 +20,21 @@
     "ai",
     "api"
   ],
-  "author": "",
+  "author": "samson910022",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/samson910022/OpenCode2API.git"
+  },
+  "homepage": "https://github.com/samson910022/OpenCode2API#readme",
+  "bugs": {
+    "url": "https://github.com/samson910022/OpenCode2API/issues"
+  },
   "license": "MIT",
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "^1.1.51",
+    "@opencode-ai/sdk": "^1.18.29",
     "axios": "^1.7.9",
     "body-parser": "^1.20.3",
     "cors": "^2.8.5",

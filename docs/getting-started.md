@@ -30,8 +30,8 @@
 
 | 步骤 | 命令 |
 |:-----|:-----|
-| 1. 克隆项目 | `git clone https://github.com/TiaraBasori/opencode2api.git` |
-| 2. 进入目录 | `cd opencode2api` |
+| 1. 克隆项目 | `git clone https://github.com/samson910022/OpenCode2API.git` |
+| 2. 进入目录 | `cd OpenCode2API` |
 | 3. 复制配置 | `cp .env.example .env` |
 | 4. 启动服务 | `docker compose up -d` |
 
@@ -39,8 +39,8 @@
 
 | 步骤 | 命令 |
 |:-----|:-----|
-| 1. 克隆项目 | `git clone https://github.com/TiaraBasori/opencode2api.git` |
-| 2. 进入目录 | `cd opencode2api` |
+| 1. 克隆项目 | `git clone https://github.com/samson910022/OpenCode2API.git` |
+| 2. 进入目录 | `cd OpenCode2API` |
 | 3. 安装依赖 | `npm install` |
 | 4. 复制配置 | `cp config.json.example config.json` |
 | 5. 安装 CLI | `npm install -g opencode-ai` |
@@ -82,7 +82,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt5-nano",
+    "model": "opencode/muse-spark-1.3-contributor-free",
     "input": "Say hi in one sentence.",
     "reasoning": {"effort": "high"},
     "stream": true

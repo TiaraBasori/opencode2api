@@ -11,8 +11,8 @@
 ### 1️⃣ 克隆项目
 
 ```bash
-git clone https://github.com/TiaraBasori/opencode2api.git
-cd opencode2api
+git clone https://github.com/samson910022/OpenCode2API.git
+cd OpenCode2API
 ```
 
 ### 2️⃣ 配置环境变量

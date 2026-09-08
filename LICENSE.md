@@ -19,3 +19,10 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+Upstream attribution:
+This project is a fork of https://github.com/TiaraBasori/opencode2api
+by TiaraBasori and contributors. Upstream code is used under the MIT License.
+Inspired in part by https://github.com/dxxzst/opencode-to-openai
+and https://github.com/lucasliet/opencode-openai-proxy.
