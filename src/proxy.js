@@ -71,11 +71,17 @@ function isTransientUpstreamError(error) {
     if (transientSignatures.some((re) => re.test(message))) return true;
 
     // Upstream errors arrive as "<status>: {json}" strings; SDK errors may also
-    // carry a numeric status on the object itself.
-    const statusMatch = message.match(/\b(\d{3}):/);
-    const status = statusMatch
-        ? Number(statusMatch[1])
-        : (error.statusCode || error.data?.status || null);
+    // carry a numeric status on the object itself. Only accept a leading
+    // "<status>:" prefix — a loose \b(\d{3}): match misfires on embedded
+    // numbers like "retry after 300: ...".
+    let status = error.statusCode ?? error.data?.status ?? null;
+    if (typeof status !== 'number') {
+        const statusCandidates = [error.message, error.data?.message].filter((part) => typeof part === 'string');
+        for (const candidate of statusCandidates) {
+            const prefixMatch = candidate.match(/^\s*(\d{3})\s*:/);
+            if (prefixMatch) { status = Number(prefixMatch[1]); break; }
+        }
+    }
     if (typeof status === 'number') {
         if (status === 401 || status === 402 || status === 429) return true;
         if (status >= 500) return true;
@@ -105,7 +111,7 @@ function normalizeBackendError(raw) {
     }
     let statusCode = raw?.statusCode ?? raw?.data?.statusCode ?? raw?.data?.status ?? null;
     if (typeof statusCode !== 'number') {
-        const m = String(message).match(/\b(\d{3})\s*:/);
+        const m = String(message).match(/^\s*(\d{3})\s*:/);
         if (m) statusCode = Number(m[1]);
     }
     if (typeof statusCode !== 'number') {
@@ -3383,7 +3389,8 @@ export function createApp(config) {
                         });
                     }
                     try {
-                        res.write(sseEvent('error', { type: 'error', error: { type: 'api_error', message: error.message } }));
+                        const t = transformUpstreamError(error);
+                        res.write(sseEvent('error', { type: 'error', error: { type: t.error.type || 'api_error', message: t.error.message, ...(t.error.code && { code: t.error.code }) } }));
                     } catch {}
                     return res.end();
                 }
