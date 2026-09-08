@@ -165,7 +165,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "opencode/big-pickle",
+    "model": "opencode/muse-spark-1.3-contributor-free",
     "input": "打招呼",
     "reasoning": {"effort": "high"},
     "stream": true
@@ -179,7 +179,7 @@ curl -X POST http://127.0.0.1:10000/v1/responses \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "opencode/big-pickle",
+    "model": "opencode/muse-spark-1.3-contributor-free",
     "input": "东京现在天气怎么样？",
     "tools": [
       {
@@ -253,7 +253,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "opencode/big-pickle",
+    "model": "opencode/muse-spark-1.3-contributor-free",
     "input": "查询东京天气",
     "stream": true,
     "tools": [
@@ -279,8 +279,68 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 
 - Chat Completions 会在 `chat.completion.chunk` 中返回 `delta.tool_calls`
 - Responses API 会返回 `response.output_item.added`、`response.function_call_arguments.delta`、`response.function_call_arguments.done`、`response.output_item.done` 等事件
+- Messages API 会返回 `message_start`、`content_block_start`、`content_block_delta`（`text_delta`/`thinking_delta`/`input_json_delta`）、`content_block_stop`、`message_delta`、`message_stop`（无 `[DONE]`）
 
 > 注意：代理内部会使用命名空间隔离同名工具，但这些内部名称不会作为公开 API 返回给客户端。
+
+---
+
+### 🟣 Messages API（Anthropic 兼容）
+
+`POST /v1/messages`。认证可用 `Authorization: Bearer` 或 `x-api-key`；`max_tokens` 必填；首条 message 须为 `user`。
+
+| 字段 | 说明 |
+|:-----|:-----|
+| `model` | 模型 ID（支持 `opencode/` 前缀或裸名） |
+| `max_tokens` | 必填，最大输出 tokens |
+| `system` | string 或 `[{type:'text', text}]` |
+| `messages` | `user`/`assistant` 数组，content 支持 `text`、`image`（base64/url）、`tool_use`、`tool_result` |
+| `tools` | `[{name, description, input_schema}]`（`input_schema` 即 JSON Schema） |
+| `tool_choice` | `{type:'auto'|'any'|'tool'|'none', name?}`（`any`≈强制调用） |
+| `thinking` | `{type:'enabled', budget_tokens}` 映射为推理强度（`disabled`→关闭） |
+| `stream` | bool，流式返回 Anthropic SSE 事件 |
+| `temperature` / `top_p` / `stop_sequences` | 透传（`stop_sequences`→`stop`）；`top_k` 暂忽略 |
+
+**示例:**
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/messages \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/muse-spark-1.3-contributor-free",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "用一句话打招呼"}]
+  }'
+```
+
+**带工具的示例:**
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/messages \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/muse-spark-1.3-contributor-free",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "查询东京天气"}],
+    "tools": [
+      {
+        "name": "weather_lookup",
+        "description": "Look up weather by city",
+        "input_schema": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    ]
+  }'
+```
+
+工具调用以 `content: [{type:'tool_use', id, name, input}]` 返回（`stop_reason: 'tool_use'`），下一轮把 `tool_use` + `tool_result` 回灌进 `messages` 即可继续。`thinking` 以无签名 `thinking` block 返回（多轮透传签名暂为占位空串）。
 
 ---
 
