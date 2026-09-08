@@ -47,7 +47,7 @@ if [[ "$1" == "opencode" && "$2" == "serve" ]]; then
     echo "Waiting for OpenCode Server to become available..."
     MAX_RETRIES=30
     COUNT=0
-    while ! curl -s http://127.0.0.1:${SERVER_PORT}/health > /dev/null; do
+    while ! curl -s -m 5 http://127.0.0.1:${SERVER_PORT}/health > /dev/null; do
         if [ $COUNT -ge $MAX_RETRIES ]; then
             echo "Timeout waiting for OpenCode Server."
             kill $SERVER_PID 2>/dev/null
