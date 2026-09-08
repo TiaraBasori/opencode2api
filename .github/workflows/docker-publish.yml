@@ -12,6 +12,8 @@ env:
 
 jobs:
   build-and-push:
+    # Forks share this file but must not push to the upstream image namespace.
+    if: github.repository == 'TiaraBasori/OpenCode2API'
     runs-on: ubuntu-latest
     permissions:
       contents: read
