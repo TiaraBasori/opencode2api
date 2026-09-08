@@ -1,4 +1,5 @@
 import { startProxy } from './src/proxy.js';
+import { resolveMaxRetries } from './src/retry/policy.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -91,6 +92,7 @@ const finalConfig = {
     METRICS_REQUIRE_AUTH: parseBool(process.env.OPENCODE_METRICS_REQUIRE_AUTH, parseBool(fileConfig.METRICS_REQUIRE_AUTH, defaultConfig.METRICS_REQUIRE_AUTH)),
     USE_ISOLATED_HOME: parseBool(process.env.OPENCODE_USE_ISOLATED_HOME, parseBool(fileConfig.USE_ISOLATED_HOME, false)),
     REQUEST_TIMEOUT_MS: parseInt(process.env.OPENCODE_PROXY_REQUEST_TIMEOUT_MS) || fileConfig.REQUEST_TIMEOUT_MS || 180000,
+    RETRY_MAX_RETRIES: process.env.OPENCODE_PROXY_RETRY_MAX_RETRIES ?? fileConfig.RETRY_MAX_RETRIES ?? 3,
     DEBUG: parseBool(process.env.OPENCODE_PROXY_DEBUG, parseBool(fileConfig.DEBUG, false)),
     ZEN_API_KEY: process.env.OPENCODE_ZEN_API_KEY || fileConfig.ZEN_API_KEY || '',
     PROMPT_MODE: process.env.OPENCODE_PROXY_PROMPT_MODE || fileConfig.PROMPT_MODE || defaultConfig.PROMPT_MODE,
@@ -140,6 +142,7 @@ console.log(`  - Metrics Enabled: ${finalConfig.METRICS_ENABLED ? 'Yes' : 'No'}`
 console.log(`  - Metrics Require Auth: ${finalConfig.METRICS_REQUIRE_AUTH ? 'Yes' : 'No'}`);
 console.log(`  - Use Isolated Home: ${finalConfig.USE_ISOLATED_HOME ? 'Yes' : 'No'}`);
 console.log(`  - Request Timeout: ${finalConfig.REQUEST_TIMEOUT_MS}ms`);
+console.log(`  - Max Retries: ${resolveMaxRetries(finalConfig.RETRY_MAX_RETRIES)} (raw: ${finalConfig.RETRY_MAX_RETRIES}, total attempts 1+n)`);
 console.log(`  - Prompt Mode: ${finalConfig.PROMPT_MODE}`);
 console.log(`  - Omit System Prompt: ${finalConfig.OMIT_SYSTEM_PROMPT ? 'Yes' : 'No'}`);
 console.log(`  - Auto Cleanup Conversations: ${finalConfig.AUTO_CLEANUP_CONVERSATIONS ? 'Yes' : 'No'}`);

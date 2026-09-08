@@ -209,6 +209,7 @@ curl -X POST http://127.0.0.1:10000/v1/messages \
 | `OPENCODE_PROXY_CLEANUP_INTERVAL_MS` | `43200000` | 清理间隔 (毫秒) |
 | `OPENCODE_PROXY_CLEANUP_MAX_AGE_MS` | `86400000` | 最大存储时间 (毫秒) |
 | `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `180000` | 请求超时时间 (毫秒) |
+| `OPENCODE_PROXY_RETRY_MAX_RETRIES` | `3` | 首次失败后重试次数 (0-5，总尝试 1+n；退避指数+jitter 并优先 `retry-after`) |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode 后端地址 |
 | `OPENCODE_SERVER_PASSWORD` | - | OpenCode 后端密码 |
 | `OPENCODE_PATH` | `opencode` | OpenCode 可执行文件路径 |

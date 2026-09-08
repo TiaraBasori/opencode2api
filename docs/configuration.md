@@ -47,6 +47,9 @@
 | `CLEANUP_INTERVAL_MS` | `43200000` | 清理间隔 (毫秒) |
 | `CLEANUP_MAX_AGE_MS` | `86400000` | 最大存储时间 (毫秒) |
 | `REQUEST_TIMEOUT_MS` | `180000` | 请求超时时间 (毫秒) |
+| `RETRY_MAX_RETRIES` / `OPENCODE_PROXY_RETRY_MAX_RETRIES` | `3` | 首次失败后重试次数 (0-5，总尝试 1+n；退避指数+jitter 并优先 `retry-after`) |
+
+> 重试退避移植自上游 `session/retry.ts`（`2s×2ⁿ⁻¹` +25% jitter），但 `retry-after` 等待 clamp 在 30s（上游近无界；网关面对自带超时的客户端不宜久睡）。旧部署注意：默认总尝试由 3 次变为 1+3=4 次，如需接近旧次数可设 `2`。
 
 ### 调试配置
 
@@ -81,7 +84,8 @@
     "DEBUG": false,
     "OPENCODE_SERVER_URL": "http://127.0.0.1:10001",
     "OPENCODE_PATH": "opencode",
-    "REQUEST_TIMEOUT_MS": 180000
+    "REQUEST_TIMEOUT_MS": 180000,
+    "RETRY_MAX_RETRIES": 3
 }
 ```
 
