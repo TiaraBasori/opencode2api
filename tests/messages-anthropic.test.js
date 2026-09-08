@@ -112,13 +112,15 @@ describe('POST /v1/messages', () => {
         const res = await request(app).post('/v1/messages')
             .send({ model: 'opencode/muse-spark-1.3-contributor-free', max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] });
         expect(res.statusCode).toBe(401);
+        expect(res.body.type).toBe('error');
     });
-    test('tiny max_tokens reports max_tokens stop_reason', async () => {
+    test('tiny max_tokens does not fake max_tokens stop_reason (usage is estimated)', async () => {
         const res = await request(app).post('/v1/messages')
             .set('Authorization', 'Bearer test-key')
             .send({ model: 'opencode/muse-spark-1.3-contributor-free', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] });
         expect(res.statusCode).toBe(200);
-        expect(res.body.stop_reason).toBe('max_tokens');
+        // Backend does not surface truncation; stop_reason comes from tool calls only.
+        expect(res.body.stop_reason).toBe('end_turn');
     });
     test('missing max_tokens -> 400', async () => {
         const res = await request(app).post('/v1/messages')

@@ -568,6 +568,9 @@ export function createApp(config) {
             const authHeader = req.headers.authorization;
             const apiKeyHeader = req.headers['x-api-key'];
             if (!((authHeader && authHeader === `Bearer ${API_KEY}`) || (apiKeyHeader && apiKeyHeader === API_KEY))) {
+                if (req.path === '/v1/messages') {
+                    return res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Unauthorized' } });
+                }
                 return res.status(401).json({ error: { message: 'Unauthorized' } });
             }
         }
@@ -796,8 +799,8 @@ export function createApp(config) {
     };
 
     const normalizeToolArguments = (args) => {
+        if (args === undefined || args === null || args === '') return '{}';
         if (typeof args === 'string') return args;
-        if (args === undefined) return '{}';
         try {
             return JSON.stringify(args);
         } catch (e) {
@@ -827,7 +830,8 @@ export function createApp(config) {
             registry,
             exposure,
             toolChoice: exposure.toolChoice,
-            prompt: exposure.prompt
+            prompt: exposure.prompt,
+            reminder: exposure.reminder
         };
     };
 
@@ -868,9 +872,10 @@ export function createApp(config) {
             ? createExternalToolContext(tools, toolChoice)
             : {
                 registry: [],
-                exposure: { tools: [], toolChoice: { mode: 'auto', requiredTool: null }, prompt: '' },
+                exposure: { tools: [], toolChoice: { mode: 'auto', requiredTool: null }, prompt: '', reminder: '' },
                 toolChoice: { mode: 'auto', requiredTool: null },
-                prompt: ''
+                prompt: '',
+                reminder: ''
             };
 
         return {
@@ -2989,7 +2994,7 @@ export function createApp(config) {
                     const {
                         model, system, messages, tools = [], tool_choice,
                         stream: requestStream, temperature, top_p, top_k,
-                        max_tokens, stop_sequences, thinking, metadata
+                        max_tokens, stop_sequences, thinking
                     } = req.body;
                     const stream = Boolean(requestStream);
                     const chatMessages = anthropicMessagesToChatMessages(messages);
@@ -3106,6 +3111,19 @@ export function createApp(config) {
                     const messageId = `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
                     const inputTokens = estimateTokens(fullPromptText + (systemWithGuard || ''));
 
+                    const makeForcedMessagesToolCallRequester = () => createForcedToolCallRequester({
+                        mode: externalToolChoice.mode,
+                        sessionId,
+                        systemWithGuard,
+                        requiredTool: externalToolChoice.requiredTool || externalToolRegistry[0]?.namespacedName,
+                        providerID: pID,
+                        modelID: mID,
+                        toolOverrides,
+                        requestTimeoutMs: REQUEST_TIMEOUT_MS,
+                        forbidThinkBlock: true
+                    });
+                    let requestForcedMessagesToolCall = makeForcedMessagesToolCallRequester();
+
                     const finalizeAnthropic = (content, reasoning, validatedToolCalls) => {
                         const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
                         const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
@@ -3116,13 +3134,11 @@ export function createApp(config) {
                             try { input = JSON.parse(tc.function.arguments || '{}'); } catch { input = {}; }
                             return { id: tc.id, function: { name: tc.function.name, arguments: tc.function.arguments }, _input: input };
                         });
+                        // Token counts are estimates (chars/4); the backend does not surface
+                        // real usage or a truncation signal, so stop_reason is derived from
+                        // tool calls only and never inferred from max_tokens.
                         const outputTokens = estimateTokens(safeContent + safeReasoning + JSON.stringify(anthropicTools));
-                        // finish is not surfaced by poll/collect helpers (same as chat route);
-                        // approximate truncation when output hits max_tokens.
-                        let finish = 'stop';
-                        if (requestParams.max_tokens && outputTokens >= requestParams.max_tokens) finish = 'length';
-                        const stopReason = mapFinishToStopReason(finish, anthropicTools.length > 0);
-                        const inputTokens = estimateTokens(fullPromptText + (systemWithGuard || ''));
+                        const stopReason = mapFinishToStopReason('stop', anthropicTools.length > 0);
                         return buildAnthropicMessage({
                             messageId, model: publicModel, text: safeContent || '',
                             reasoning: safeReasoning || '', toolCalls: anthropicTools,
@@ -3140,6 +3156,7 @@ export function createApp(config) {
                                 const r = await client.session.create();
                                 sessionId = r.data?.id;
                                 promptParams.path.id = sessionId;
+                                requestForcedMessagesToolCall = makeForcedMessagesToolCallRequester();
                                 await sleep(RETRY_BACKOFF_BASE_MS * attempt);
                             }
                             await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
@@ -3154,7 +3171,15 @@ export function createApp(config) {
                             const t = transformUpstreamError(error);
                             return res.status(502).json({ type: 'error', error: { type: 'api_error', message: t.error?.error?.message || t.error?.message || 'Upstream error' } });
                         }
-                        const parsed = externalToolRegistry.length > 0 ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content) : [];
+                        let parsed = externalToolRegistry.length > 0 ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content) : [];
+                        if (parsed.length === 0 && externalToolChoice.mode === 'required') {
+                            const forcedResponse = await requestForcedMessagesToolCall();
+                            if (forcedResponse) {
+                                content = forcedResponse.content || content;
+                                reasoning = forcedResponse.reasoning || reasoning;
+                                parsed = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
+                            }
+                        }
                         const { validCalls } = finalizeValidatedToolCalls(parsed, externalToolRegistry);
                         return res.json(finalizeAnthropic(content, reasoning, validCalls));
                     }
@@ -3176,30 +3201,37 @@ export function createApp(config) {
                     const parseReason = createExternalToolCallStreamParser(externalToolRegistry);
                     let textBlockOpen = false;
                     let thinkingBlockOpen = false;
-                    let blockIndex = 0;
-                    const textIndex = 1;
-                    const thinkingIndex = 0;
+                    let nextBlockIndex = 0;
+                    let textIndex = null;
+                    let thinkingIndex = null;
+                    const ensureTextIndex = () => {
+                        if (textIndex === null) textIndex = nextBlockIndex++;
+                        return textIndex;
+                    };
+                    const ensureThinkingIndex = () => {
+                        if (thinkingIndex === null) thinkingIndex = nextBlockIndex++;
+                        return thinkingIndex;
+                    };
                     res.write(sseEvent('message_start', { type: 'message_start', message: { id: messageId, type: 'message', role: 'assistant', model: publicModel, content: [], stop_reason: null, usage: { input_tokens: inputTokens, output_tokens: 0 } } }));
                     const sendTextDelta = (delta) => {
                         if (!delta) return;
+                        const idx = ensureTextIndex();
                         if (!textBlockOpen) {
-                            // thinking (index 0) must precede text; open thinking first if reasoning arrived earlier is handled separately.
-                            res.write(sseEvent('content_block_start', { type: 'content_block_start', index: textIndex, content_block: { type: 'text', text: '' } }));
+                            res.write(sseEvent('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'text', text: '' } }));
                             textBlockOpen = true;
-                            if (textIndex >= blockIndex) blockIndex = textIndex + 1;
                         }
                         streamedText += delta;
-                        res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: textIndex, delta: { type: 'text_delta', text: delta } }));
+                        res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: delta } }));
                     };
                     const sendReasoningDelta = (delta) => {
                         if (!delta) return;
+                        const idx = ensureThinkingIndex();
                         if (!thinkingBlockOpen) {
-                            res.write(sseEvent('content_block_start', { type: 'content_block_start', index: thinkingIndex, content_block: { type: 'thinking', thinking: '', signature: '' } }));
+                            res.write(sseEvent('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'thinking', thinking: '', signature: '' } }));
                             thinkingBlockOpen = true;
-                            if (thinkingIndex >= blockIndex) blockIndex = thinkingIndex + 1;
                         }
                         streamedReasoning += delta;
-                        res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: thinkingIndex, delta: { type: 'thinking_delta', thinking: delta } }));
+                        res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'thinking_delta', thinking: delta } }));
                     };
                     const sendDelta = (delta, isReasoning = false) => {
                         if (!delta) return;
@@ -3229,14 +3261,40 @@ export function createApp(config) {
                     }
                     if (textBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
                     if (thinkingBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: thinkingIndex }));
-                    // Tool calls buffered during stream -> emit as tool_use blocks.
-                    const parsedFinal = externalToolRegistry.length > 0
-                        ? parseExternalToolCallsFromText(externalToolRegistry, rawReasoning || streamedReasoning, rawContent || streamedText)
-                        : [];
-                    const { validCalls } = finalizeValidatedToolCalls([...streamedToolCalls.map((tc) => ({ id: tc.id, function: tc.function, tool: findExternalToolByName(externalToolRegistry, tc.function?.name)?.originalName ? { originalName: tc.function.name } : undefined })), ...parsedFinal], externalToolRegistry);
-                    // Note: streamedToolCalls already validated via parser shape; re-validate parsedFinal only for safety.
-                    const finalValidated = validCalls.length ? validCalls : finalizeValidatedToolCalls(parsedFinal, externalToolRegistry).validCalls;
-                    let toolBlockIndex = blockIndex;
+                    // Flush held buffers before final parse (mirrors /v1/chat/completions).
+                    const flushedReasoningCalls = parseReason.flush ? parseReason.flush() : [];
+                    const flushedContentCalls = parseContent.flush ? parseContent.flush() : [];
+                    const flushedReasoningText = filterReasoning.flush ? filterReasoning.flush() : '';
+                    const flushedContentText = filterContent.flush ? filterContent.flush() : '';
+                    const finalReasoningText = rawReasoning + flushedReasoningText;
+                    const finalContentText = rawContent + flushedContentText;
+                    const parseStreamedToolCalls = () => {
+                        if (externalToolRegistry.length === 0) return [];
+                        const perChannel = [
+                            ...flushedReasoningCalls,
+                            ...flushedContentCalls,
+                            ...parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText, finalContentText)
+                        ];
+                        if (perChannel.length > 0) return perChannel;
+                        return parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText + finalContentText);
+                    };
+                    // Exclusive: incremental hits already describe the same markup that a
+                    // full re-parse would find again, so never combine both (else 1 call -> 2 blocks).
+                    let parsedToolCalls = streamedToolCalls.length > 0
+                        ? [...streamedToolCalls, ...flushedReasoningCalls, ...flushedContentCalls]
+                        : parseStreamedToolCalls();
+                    if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                        const forcedResponse = await requestForcedMessagesToolCall();
+                        if (forcedResponse) {
+                            parsedToolCalls = parseExternalToolCallsFromText(
+                                externalToolRegistry,
+                                forcedResponse.reasoning,
+                                forcedResponse.content
+                            );
+                        }
+                    }
+                    const { validCalls: finalValidated } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
+                    let toolBlockIndex = nextBlockIndex;
                     for (const tc of toPublicToolCalls(finalValidated)) {
                         res.write(sseEvent('content_block_start', { type: 'content_block_start', index: toolBlockIndex, content_block: { type: 'tool_use', id: tc.id, name: tc.function.name, input: {} } }));
                         res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: toolBlockIndex, delta: { type: 'input_json_delta', partial_json: tc.function.arguments || '{}' } }));
@@ -3244,9 +3302,7 @@ export function createApp(config) {
                         toolBlockIndex += 1;
                     }
                     const outputTokens = estimateTokens(streamedText + streamedReasoning);
-                    let streamFinish = 'stop';
-                    if (requestParams.max_tokens && outputTokens >= requestParams.max_tokens) streamFinish = 'length';
-                    const stopReason = mapFinishToStopReason(streamFinish, finalValidated.length > 0);
+                    const stopReason = mapFinishToStopReason('stop', finalValidated.length > 0);
                     res.write(sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } }));
                     res.write(sseEvent('message_stop', { type: 'message_stop' }));
                     if (keepaliveInterval) clearInterval(keepaliveInterval);

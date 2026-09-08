@@ -10,11 +10,16 @@
 export function sanitizeClaudeToolId(id) {
     const s = String(id || '').replace(/[^a-zA-Z0-9_-]/g, '_');
     if (s) return s;
-    return `toolu_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e6).toString(36)}`;
+    return generateClaudeToolCallId();
 }
 
 export function generateClaudeToolCallId() {
-    return `toolu_${Math.random().toString(36).slice(2, 14).padEnd(12, '0')}${Math.random().toString(36).slice(2, 6)}`;
+    try {
+        if (typeof globalThis.crypto?.randomUUID === 'function') {
+            return `toolu_${globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
+        }
+    } catch {}
+    return `toolu_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e9).toString(36)}`;
 }
 
 export function anthropicError(type, message, statusCode = 400) {
@@ -72,7 +77,13 @@ export function anthropicMessagesToChatMessages(anthropicMessages = []) {
         if (!Array.isArray(content)) continue;
         const textParts = [];
         const toolCalls = [];
-        const toolResults = [];
+        const ordered = [];
+        const flushText = () => {
+            if (textParts.length) {
+                ordered.push({ role, content: textParts.join('\n\n') });
+                textParts.length = 0;
+            }
+        };
         for (const block of content) {
             if (!block || typeof block !== 'object') continue;
             if (block.type === 'text') {
@@ -81,16 +92,16 @@ export function anthropicMessagesToChatMessages(anthropicMessages = []) {
                 const src = block.source || {};
                 if (src.type === 'base64' && src.data) {
                     const mime = src.media_type || 'image/png';
-                    toolResults.push(null); // placeholder no-op, keep order simple
-                    textParts.push(`[image: ${mime}]`);
-                    // Represent as image_url so chat builder downloads/embeds it.
-                    // Caller handles actual dataUri conversion; keep marker here.
-                    chatMessages.push({
+                    // Flush pending text first so [text, image, text] keeps its order.
+                    // No marker text: the image_url part alone carries the image downstream.
+                    flushText();
+                    ordered.push({
                         role,
                         content: [{ type: 'image_url', image_url: { url: `data:${mime};base64,${src.data}` } }]
                     });
                 } else if (src.type === 'url' && src.url) {
-                    chatMessages.push({ role, content: [{ type: 'image_url', image_url: { url: src.url } }] });
+                    flushText();
+                    ordered.push({ role, content: [{ type: 'image_url', image_url: { url: src.url } }] });
                 }
             } else if (block.type === 'tool_use') {
                 toolCalls.push({
@@ -103,7 +114,8 @@ export function anthropicMessagesToChatMessages(anthropicMessages = []) {
                     ? block.content.map(textOfBlock).filter(Boolean).join('\n')
                     : (typeof block.content === 'string' ? block.content : JSON.stringify(block.content ?? ''));
                 const prefix = block.is_error ? 'ERROR: ' : '';
-                toolResults.push({
+                flushText();
+                ordered.push({
                     role: 'tool',
                     tool_call_id: block.tool_use_id,
                     name: 'unknown',
@@ -115,14 +127,12 @@ export function anthropicMessagesToChatMessages(anthropicMessages = []) {
                 if (block.thinking) textParts.push(block.thinking);
             }
         }
-        // Remove placeholder nulls
-        for (const tr of toolResults) {
-            if (tr) chatMessages.push(tr);
-        }
         if (toolCalls.length) {
+            chatMessages.push(...ordered);
             chatMessages.push({ role: 'assistant', tool_calls: toolCalls, content: textParts.join('\n\n') || null });
-        } else if (textParts.length) {
-            chatMessages.push({ role, content: textParts.join('\n\n') });
+        } else {
+            flushText();
+            chatMessages.push(...ordered);
         }
     }
     return chatMessages.filter((m) => m && (m.content || m.tool_calls));
@@ -161,7 +171,7 @@ export function anthropicThinkingToReasoningEffort(thinking) {
         const budget = typeof thinking.budget_tokens === 'number' ? thinking.budget_tokens : 0;
         if (budget >= 24000) return 'high';
         if (budget >= 8000) return 'medium';
-        return 'medium';
+        return 'low';
     }
     return null;
 }
