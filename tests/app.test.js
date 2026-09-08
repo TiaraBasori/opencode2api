@@ -2178,7 +2178,7 @@ describe('Proxy OpenAI API', () => {
                 properties: {
                     info: {
                         sessionID: sessionId,
-                        error: { name: 'CreditsError', data: { message: '401: {"message":"Insufficient balance. Manage your billing here: https://example.ai","type":"CreditsError","param":"","code":null}' } }
+                        error: { name: 'CreditsError', data: { message: '401: {"message":"Insufficient balance. Manage your billing here: https://example.ai","type":"CreditsError","param":"","code":null}', responseHeaders: { 'retry-after-ms': '10' } } }
                     }
                 }
             }];
@@ -2214,7 +2214,7 @@ describe('Proxy OpenAI API', () => {
             .mockResolvedValueOnce([{
                 info: {
                     role: 'assistant',
-                    error: { name: 'CreditsError', data: { message: '401: Insufficient balance' } }
+                    error: { name: 'CreditsError', data: { message: '401: Insufficient balance', responseHeaders: { 'retry-after-ms': '10' } } }
                 },
                 parts: []
             }])

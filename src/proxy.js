@@ -69,7 +69,7 @@ function isTransientUpstreamError(error) {
     // ("Insufficient balance"/CreditsError) never carries these strings, so
     // it still retries. Placed after isRetryable so a provider-explicit
     // retryable flag keeps winning (upstream-faithful).
-    if (/invalid api key|unauthorized|authentication failed/i.test(message)) return false;
+    if (/invalid[_\s]?api[_\s]?key|unauthorized|authentication (failed|error)|api key (expired|invalid|incorrect)/i.test(message)) return false;
 
     const transientSignatures = [
         /insufficient balance/i,
@@ -3059,7 +3059,7 @@ export function createApp(config) {
                     : [];
             }
 
-            if (!content && !reasoning && responseRes.data && promptBasedToolCalls.length === 0) {
+            if (!content && !reasoning && responseRes?.data && promptBasedToolCalls.length === 0) {
                 const data = responseRes.data;
                 content = typeof data === 'string' ? data : data?.message || JSON.stringify(data);
             }

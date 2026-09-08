@@ -244,5 +244,22 @@ describe('POST /v1/responses backend plain-object error', () => {
             expect(res.statusCode).toBe(502);
             expect(sdkMocks.sessionCreate.mock.calls.length).toBe(1);
         });
+
+        test.each([
+            ['Authentication error', '401: Authentication error'],
+            ['expired key', 'API key expired'],
+            ['underscore code', 'invalid_api_key']
+        ])('auth variant skips retry: %s', async (_label, msg) => {
+            sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
+            sdkMocks.sessionMessages.mockImplementation(async () => ([
+                { info: { role: 'assistant', finish: 'stop', error: { name: 'ProviderAuthError', data: { message: msg } } }, parts: [] }
+            ]));
+            const chatApp = buildApp(undefined);
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+            expect(res.statusCode).toBe(502);
+            expect(sdkMocks.sessionCreate.mock.calls.length).toBe(1);
+        });
     });
 });
