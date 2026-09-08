@@ -48,7 +48,9 @@ import {
  */
 function isTransientUpstreamError(error) {
     if (!error) return false;
-    const message = [error.message, error.data?.message]
+    // Backend failures arrive as plain objects ({name, data:{message}}); include
+    // name/code/type so signature matching works even without a message string.
+    const message = [error.message, error.data?.message, error.name, error.code, error.type]
         .filter((part) => typeof part === 'string')
         .join(' ');
     if (!message) return false;
@@ -82,16 +84,62 @@ function isTransientUpstreamError(error) {
 }
 
 /**
+ * Normalize a backend error into a real Error instance.
+ *
+ * The OpenCode backend surfaces failures as plain objects
+ * ({name, data:{message, statusCode?}}, see SDK types.gen AssistantMessage
+ * error union), never as Error instances. Throwing one raw makes
+ * transformUpstreamError fall back to 500/"Internal server error"/code
+ * "Object" and drops the real message. Normalizing once at the throw
+ * site (or poll exit) keeps every downstream reader working.
+ */
+function normalizeBackendError(raw) {
+    if (raw instanceof Error) return raw;
+    let message = raw?.data?.message ?? raw?.message ?? raw?.name ?? null;
+    if (typeof message !== 'string' || !message) {
+        try {
+            message = JSON.stringify(raw) ?? String(raw?.name || 'Upstream provider error');
+        } catch {
+            message = String(raw?.name || 'Upstream provider error');
+        }
+    }
+    let statusCode = raw?.statusCode ?? raw?.data?.statusCode ?? raw?.data?.status ?? null;
+    if (typeof statusCode !== 'number') {
+        const m = String(message).match(/\b(\d{3})\s*:/);
+        if (m) statusCode = Number(m[1]);
+    }
+    if (typeof statusCode !== 'number') {
+        const s = String(message).toLowerCase();
+        if (/insufficient balance|credits?error|insufficient credits|billing|quota exceeded|credit limit/.test(s)) statusCode = 402;
+        else if (/rate.?limit|too many requests|worker request limit/.test(s)) statusCode = 429;
+        else if (/invalid api key|unauthorized|authentication/.test(s)) statusCode = 401;
+    }
+    const err = new Error(message);
+    if (typeof statusCode === 'number') err.statusCode = statusCode;
+    err.code = raw?.code ?? raw?.type ?? raw?.name ?? 'upstream_error';
+    err.type = raw?.type ?? raw?.code ?? raw?.name ?? 'upstream_error';
+    if (raw?.data !== undefined) err.data = raw.data;
+    err.cause = raw;
+    return err;
+}
+
+/**
  * Transform upstream provider errors to OpenAI-compatible format
  * @param {Error} error - The error from the upstream provider
  * @returns {{statusCode: number, error: {message: string, type: string, code?: string}}} OpenAI-compatible error response
  */
 function transformUpstreamError(error) {
+    // Defense in depth: callers may hand us a raw backend plain object
+    // ({name, data:{message}}) instead of an Error. Normalize first so the
+    // mapping below sees message/statusCode/code instead of falling back
+    // to 500/"Internal server error"/code "Object".
+    const normalized = normalizeBackendError(error);
+    error = normalized;
     // Default fallback
     let statusCode = 500;
     let message = error.message || 'Internal server error';
     let type = 'internal_error';
-    let code = error.code || error.constructor.name;
+    let code = error.code || 'upstream_error';
 
     // Handle timeout errors
     if (error.message && error.message.includes('Request timeout')) {
@@ -2717,11 +2765,12 @@ export function createApp(config) {
 
                 if (!content && !reasoning) {
                     const polled = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                    if (polled.error && !polled.content && !polled.reasoning) throw polled.error;
+                    if (polled.error && !polled.content && !polled.reasoning) throw normalizeBackendError(polled.error);
                     if (polled.reasoning) sendResponsesDelta(polled.reasoning, true);
                     if (polled.content) sendResponsesDelta(polled.content, false);
                 } else if (collected && collected.idleTimeout) {
                     const polled = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                    if (polled.error && !polled.content && !polled.reasoning) throw normalizeBackendError(polled.error);
                     const remainingReasoning = polled.reasoning && polled.reasoning.startsWith(rawReasoning)
                         ? polled.reasoning.slice(rawReasoning.length)
                         : polled.reasoning;
@@ -2890,7 +2939,7 @@ export function createApp(config) {
             if (shouldPollForResponses) {
                 const polledResponse = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
                 if (polledResponse.error && !polledResponse.content && !polledResponse.reasoning) {
-                    throw polledResponse.error;
+                    throw normalizeBackendError(polledResponse.error);
                 }
                 content = polledResponse.content || content;
                 reasoning = polledResponse.reasoning || reasoning;
@@ -2968,7 +3017,7 @@ export function createApp(config) {
                     const failedAt = Math.floor(Date.now() / 1000);
                     res.write(`data: ${JSON.stringify({
                         type: 'response.failed',
-                        response: { id: `resp_${crypto.randomUUID()}`, object: 'response', created: failedAt, created_at: failedAt, status: 'failed', error: transformed.error.error || transformed.error }
+                        response: { id: `resp_${crypto.randomUUID()}`, object: 'response', created: failedAt, created_at: failedAt, status: 'failed', error: transformed.error }
                     })}\n\n`);
                     res.write('data: [DONE]\n\n');
                 } catch (writeError) {
@@ -3169,7 +3218,14 @@ export function createApp(config) {
                         }
                         if (error && !content && !reasoning) {
                             const t = transformUpstreamError(error);
-                            return res.status(502).json({ type: 'error', error: { type: 'api_error', message: t.error?.error?.message || t.error?.message || 'Upstream error' } });
+                            return res.status(t.statusCode).json({
+                                type: 'error',
+                                error: {
+                                    type: t.error.type || 'api_error',
+                                    message: t.error.message || 'Upstream error',
+                                    ...(t.error.code && { code: t.error.code })
+                                }
+                            });
                         }
                         let parsed = externalToolRegistry.length > 0 ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content) : [];
                         if (parsed.length === 0 && externalToolChoice.mode === 'required') {
@@ -3254,8 +3310,11 @@ export function createApp(config) {
                         try { if (!res.destroyed) res.end(); } catch {}
                         return;
                     }
+                    if (collected?.error && !rawContent && !rawReasoning) throw normalizeBackendError(collected.error);
                     if (collected?.__error) {
-                        const { content, reasoning } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                        const polled = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                        if (polled.error && !polled.content && !polled.reasoning && !rawContent && !rawReasoning) throw normalizeBackendError(polled.error);
+                        const { content, reasoning } = polled;
                         if (content && !rawContent) sendTextDelta(stripFunctionCallMarkup(content));
                         if (reasoning && !rawReasoning) sendReasoningDelta(stripFunctionCallMarkup(reasoning));
                     }
@@ -3314,7 +3373,14 @@ export function createApp(config) {
                     }
                     if (!res.headersSent) {
                         const t = transformUpstreamError(error);
-                        return res.status(t.statusCode).json({ type: 'error', error: { type: 'api_error', message: t.error?.error?.message || t.error?.message || error.message } });
+                        return res.status(t.statusCode).json({
+                            type: 'error',
+                            error: {
+                                type: t.error.type || 'api_error',
+                                message: t.error.message || error.message || 'Upstream error',
+                                ...(t.error.code && { code: t.error.code })
+                            }
+                        });
                     }
                     try {
                         res.write(sseEvent('error', { type: 'error', error: { type: 'api_error', message: error.message } }));
