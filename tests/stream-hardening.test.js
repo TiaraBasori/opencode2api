@@ -125,6 +125,31 @@ describe('POST /v1/responses stream hardening', () => {
         expect(res.statusCode).toBe(504);
         expect(JSON.stringify(res.body)).not.toContain('"Object"');
     }, 20000);
+
+    test('hung retry session.create surfaces a 504 instead of stalling', async () => {
+        // Attempt 1 fails transiently (fast backoff via retry-after-ms),
+        // then the retry's session.create hangs: must 504, not stall.
+        sdkMocks.sessionCreate
+            .mockImplementationOnce(async () => ({ data: { id: SESSION_ID } }))
+            .mockImplementationOnce(() => new Promise(() => {}));
+        sdkMocks.sessionPrompt.mockImplementationOnce(async () => {
+            throw {
+                name: 'CreditsError',
+                data: {
+                    message: '429: {"message":"Too many requests","type":"CreditsError"}',
+                    responseHeaders: { 'retry-after-ms': '10' }
+                }
+            };
+        });
+        const started = Date.now();
+        const res = await request(buildApp({ REQUEST_TIMEOUT_MS: 400, RETRY_MAX_RETRIES: 1 }))
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'big-pickle', input: 'hi' });
+        expect(Date.now() - started).toBeLessThan(15000);
+        expect(res.statusCode).toBe(504);
+        expect(JSON.stringify(res.body)).not.toContain('"Object"');
+    }, 20000);
 });
 
 describe('POST /v1/messages stream does not cancel itself', () => {

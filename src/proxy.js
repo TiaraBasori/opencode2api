@@ -1961,7 +1961,8 @@ export function createApp(config) {
                                 } catch (e) {
                                     logDebug('Failed to delete retried session', { sessionId, error: e.message });
                                 }
-                                const retrySessionRes = await client.session.create();
+                                const retrySessionRes = await withTimeout(
+                                    client.session.create(), REQUEST_TIMEOUT_MS, 'create session');
                                 sessionId = retrySessionRes.data?.id;
                                 if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
                                 promptParams.path.id = sessionId;
@@ -2174,7 +2175,8 @@ export function createApp(config) {
                                 } catch (e) {
                                     logDebug('Failed to delete retried session', { sessionId, error: e.message });
                                 }
-                                const retrySessionRes = await client.session.create();
+                                const retrySessionRes = await withTimeout(
+                                    client.session.create(), REQUEST_TIMEOUT_MS, 'create session');
                                 sessionId = retrySessionRes.data?.id;
                                 if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
                                 promptParams.path.id = sessionId;
@@ -3073,7 +3075,8 @@ export function createApp(config) {
                     try { await client.session.delete({ path: { id: sessionId } }); } catch (e) {
                         logDebug('Failed to delete retried session', { sessionId, error: e.message });
                     }
-                    const retrySessionRes = await client.session.create();
+                    const retrySessionRes = await withTimeout(
+                        client.session.create(), REQUEST_TIMEOUT_MS, 'create session');
                     sessionId = retrySessionRes.data?.id;
                     if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
                     promptParams.path.id = sessionId;
@@ -3397,7 +3400,8 @@ export function createApp(config) {
                             }
                             if (attempt > 1) {
                                 try { await client.session.delete({ path: { id: sessionId } }); } catch {}
-                                const r = await client.session.create();
+                                const r = await withTimeout(
+                                    client.session.create(), REQUEST_TIMEOUT_MS, 'create session');
                                 sessionId = r.data?.id;
                                 if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
                                 promptParams.path.id = sessionId;
